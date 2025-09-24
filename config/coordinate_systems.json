@@ -1,0 +1,30 @@
+{
+  "source_crs": {
+    "epsg": 4326,
+    "name": "WGS84",
+    "description": "Default GPS coordinates"
+  },
+  "target_crs": {
+    "epsg": 3857,
+    "name": "Web Mercator",
+    "description": "Local projected system - update for your region"
+  },
+  "local_origin": {
+    "x": 0,
+    "y": 0,
+    "z": 0,
+    "description": "Site-centered origin for small coordinates in Blender"
+  },
+  "precision": {
+    "decimal_places": 3,
+    "description": "Coordinate precision after processing"
+  },
+  "common_epsg_codes": {
+    "4326": "WGS84 (GPS)",
+    "3857": "Web Mercator",
+    "2154": "RGF93 / Lambert-93 (France)",
+    "25832": "ETRS89 / UTM zone 32N (Central Europe)",
+    "32633": "WGS 84 / UTM zone 33N",
+    "5514": "S-JTSK / Krovak East North"
+  }
+}

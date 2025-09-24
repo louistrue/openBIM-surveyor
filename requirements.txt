@@ -1,0 +1,16 @@
+# Core dependencies
+bpy>=3.6.0              # Blender Python API
+ifcopenshell>=0.7.0     # IFC file handling
+bonsai-blender>=0.0.1   # Bonsai BIM addon
+pyproj>=3.4.0           # Coordinate transformations
+pandas>=1.5.0           # Data manipulation
+numpy>=1.24.0           # Numerical operations
+lxml>=4.9.0             # XML processing for LandXML
+
+# QGIS integration (optional - can use QGIS GUI instead)
+# qgis>=3.28.0          # Uncomment if using QGIS Python API
+
+# Development and testing
+pytest>=7.0.0
+black>=22.0.0
+flake8>=5.0.0

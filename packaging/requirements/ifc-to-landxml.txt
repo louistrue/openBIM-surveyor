@@ -1,0 +1,4 @@
+PyQt6>=6.9.0
+ifcopenshell==0.8.3.post2
+numpy>=1.24.0
+scipy>=1.16.0
