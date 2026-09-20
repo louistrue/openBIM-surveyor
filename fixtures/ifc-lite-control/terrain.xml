@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<LandXML xmlns="http://www.landxml.org/schema/LandXML-1.2" version="1.2" date="2026-09-21" time="00:00:00">
+  <Units>
+    <Metric linearUnit="meter" areaUnit="squareMeter" volumeUnit="cubicMeter" temperatureUnit="celsius" pressureUnit="milliBars" diameterUnit="millimeter" angularUnit="decimal degrees" directionUnit="decimal degrees"/>
+  </Units>
+  <CoordinateSystem name="SWEREF99 TM" epsgCode="3006" horizontalDatum="EPSG:3006" verticalDatum="EPSG:5613"/>
+  <Project name="Synthetic ifc-lite federation control"/>
+  <Application name="bonsai-topo" version="control-v1" manufacturer="Open synthetic fixture"/>
+  <CgPoints name="Independent control points">
+    <CgPoint name="CP1" code="CONTROL">6400000.000 500000.000 100.000</CgPoint>
+    <CgPoint name="CP2" code="CONTROL">6400000.000 500020.000 101.000</CgPoint>
+    <CgPoint name="CP3" code="CONTROL">6400020.000 500000.000 102.000</CgPoint>
+    <CgPoint name="CP4" code="CONTROL">6400020.000 500020.000 103.000</CgPoint>
+    <CgPoint name="CP5" code="CONTROL">6400010.000 500010.000 101.500</CgPoint>
+  </CgPoints>
+  <Surfaces>
+    <Surface name="Synthetic control terrain" desc="Five-point asymmetric TIN">
+      <Definition surfType="TIN" elevMax="103.000" elevMin="100.000">
+        <Pnts>
+          <P id="1">6400000.000 500000.000 100.000</P>
+          <P id="2">6400000.000 500020.000 101.000</P>
+          <P id="3">6400020.000 500000.000 102.000</P>
+          <P id="4">6400020.000 500020.000 103.000</P>
+          <P id="5">6400010.000 500010.000 101.500</P>
+        </Pnts>
+        <Faces>
+          <F>1 2 5</F>
+          <F>2 4 5</F>
+          <F>4 3 5</F>
+          <F>3 1 5</F>
+        </Faces>
+      </Definition>
+    </Surface>
+  </Surfaces>
+</LandXML>
