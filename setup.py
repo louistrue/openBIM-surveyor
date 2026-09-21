@@ -39,10 +39,10 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "benny-csv-to-ifc=src.gui.csv_to_ifc_app:main",
+            "benny-csv-to-ifc=src.gui.console_wrappers:csv_to_ifc",
             "benny-ifc-to-landxml=src.core.converters.ifc_to_landxml:main",
-            "benny-ifc-to-landxml-gui=src.gui.ifc_to_landxml_app:main",
-            "benny-launcher=src.gui.main_launcher:main",
+            "benny-ifc-to-landxml-gui=src.gui.console_wrappers:ifc_to_landxml_gui",
+            "benny-launcher=src.gui.console_wrappers:launcher",
         ],
     },
     classifiers=[

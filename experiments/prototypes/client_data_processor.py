@@ -9,6 +9,14 @@ import pandas as pd
 import json
 from pathlib import Path
 
+
+def transform_info_path(output_file: str | Path) -> Path:
+    """Return the distinct JSON sibling that records one processed CSV transform."""
+
+    output_path = Path(output_file)
+    return output_path.with_name(f"{output_path.stem}_transform_info.json")
+
+
 def process_client_csv(input_file, output_file, config):
     """Process client CSV with semicolon separators and specific format"""
     print(f"Processing client data: {input_file}")
@@ -126,9 +134,9 @@ def process_client_csv(input_file, output_file, config):
             }
         }
         
-        transform_file = str(output_file).replace('.csv', '_transform_info.json')
-        with open(transform_file, 'w') as f:
-            json.dump(transform_info, f, indent=2)
+        transform_file = transform_info_path(output_file)
+        with transform_file.open("w", encoding="utf-8") as handle:
+            json.dump(transform_info, handle, indent=2)
         
         print(f"Transformation info saved: {transform_file}")
         

@@ -427,6 +427,11 @@ def _map_conversion_for_context(model: Any, context: Any) -> tuple[Any, Any]:
     scale = getattr(conversion, "Scale", None)
     if scale is not None and float(scale) == 0:
         raise LandXmlExportError("IfcMapConversion.Scale must not be zero for a terrain export.")
+    for attribute in ("ScaleY", "ScaleZ"):
+        if getattr(conversion, attribute, None) is not None:
+            raise LandXmlExportError(
+                f"IfcMapConversion.{attribute} is not supported; this producer requires one uniform Scale."
+            )
     _normalised_map_direction(conversion)
     return conversion, source_context
 

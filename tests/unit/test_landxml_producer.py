@@ -326,6 +326,16 @@ class LandXmlProducerContractTests(unittest.TestCase):
         with self.assertRaisesRegex(LandXmlExportError, "Scale must not be zero"):
             produce_terrain_mesh(model, TerrainSelection("terrain-global-id"))
 
+    def test_rejects_per_axis_map_conversion_scales(self) -> None:
+        """Regression for #5051: do not silently drop IFC 4.3 ScaleY or ScaleZ."""
+
+        for attribute in ("ScaleY", "ScaleZ"):
+            with self.subTest(attribute=attribute):
+                model = synthetic_model()
+                setattr(model.conversion, attribute, 0.5)
+                with self.assertRaisesRegex(LandXmlExportError, attribute):
+                    produce_terrain_mesh(model, TerrainSelection("terrain-global-id"))
+
     def test_rejects_self_and_two_node_conversion_unit_cycles(self) -> None:
         def conversion_unit(component: Entity | None = None) -> Entity:
             return Entity(

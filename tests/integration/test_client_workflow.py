@@ -11,6 +11,7 @@ import csv
 import importlib.util
 import json
 import os
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Barrier, Thread
@@ -69,6 +70,26 @@ class ClientWorkflowIntegrationTests(unittest.TestCase):
             with self.subTest(directory=directory):
                 with self.assertRaisesRegex(ValueError, "tracked output directory"):
                     resolve_output_directory(directory)
+
+    def test_mixed_case_csv_output_has_a_distinct_transform_json_sibling(self) -> None:
+        """Regression for #5051: replacement is suffix-safe for survey.CSV output paths."""
+
+        with mock.patch.dict(sys.modules, {"pandas": object()}):
+            from experiments.prototypes.client_data_processor import transform_info_path
+
+        output = Path("output") / "survey.CSV"
+        self.assertEqual(transform_info_path(output), Path("output") / "survey_transform_info.json")
+        self.assertNotEqual(transform_info_path(output), output)
+
+    def test_workflow_main_preserves_an_explicit_empty_argv(self) -> None:
+        """An embedding caller's empty argv must not unexpectedly consume sys.argv."""
+
+        with mock.patch.object(
+            complete_client_workflow, "parse_args", side_effect=SystemExit(2)
+        ) as parse_args:
+            with self.assertRaises(SystemExit):
+                complete_client_workflow.main([])
+        parse_args.assert_called_once_with([])
 
     def test_existing_output_directory_is_never_reused(self) -> None:
         """Directory publication needs a new destination to remain all-or-nothing."""
