@@ -5,6 +5,7 @@ Creates basic IfcAnnotation objects with SurveyData property sets
 Focuses on core functionality with proper georeferencing
 """
 
+import argparse
 import csv
 import json
 import logging
@@ -17,13 +18,12 @@ try:
     IFCOPENSHELL_AVAILABLE = True
 except ImportError:
     IFCOPENSHELL_AVAILABLE = False
-    print("❌ IfcOpenShell not available - install with: pip install ifcopenshell")
 
 def create_basic_ifc_with_survey_points(csv_file, output_file, transform_info=None):
     """Create basic IFC file with survey points as annotations"""
     
     if not IFCOPENSHELL_AVAILABLE:
-        print("❌ IfcOpenShell is required for IFC export")
+        print("IfcOpenShell is required for IFC export")
         return False
     
     logging.info("Creating IFC 4x3 from CSV: %s", csv_file)
@@ -129,14 +129,14 @@ def create_basic_ifc_with_survey_points(csv_file, output_file, transform_info=No
         origin = transform_info['local_origin']
         logging.info("Using georeferencing with origin: (%.3f, %.3f, %.3f)", origin['x'], origin['y'], origin['z'])
         
-        # Create projected CRS for SWEREF99 TM
+        # Preserve the caller's declared projected CRS; never substitute a
+        # convenient default for an unknown survey coordinate system.
+        target_crs = transform_info.get('target_crs', {})
+        crs_name = target_crs.get('name', 'SWEREF99 TM')
+        crs_epsg = target_crs.get('epsg')
         projected_crs = model.create_entity("IfcProjectedCRS")
-        projected_crs.Name = "SWEREF99 TM"
-        projected_crs.Description = "Swedish national coordinate reference system"
-        projected_crs.GeodeticDatum = "SWEREF99"
-        projected_crs.VerticalDatum = "RH2000"
-        projected_crs.MapProjection = "Transverse Mercator"
-        projected_crs.MapZone = "TM"
+        projected_crs.Name = f"EPSG:{crs_epsg} {crs_name}" if crs_epsg else crs_name
+        projected_crs.Description = "Projected CRS declared by the survey workflow"
         projected_crs.MapUnit = length_unit
         
         # Create map conversion for georeferencing
@@ -255,11 +255,12 @@ def create_basic_ifc_with_survey_points(csv_file, output_file, transform_info=No
         rel_contains.RelatingStructure = site
         rel_contains.RelatedElements = contained_elements
     
-    # Write IFC file
-    model.write(str(output_file))
-    
-    # Convert to Path object for stat() method
+    # Write IFC file. The caller chooses an output path; creating its parent
+    # makes command-line use reliable without redirecting output to samples.
     output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    model.write(str(output_file))
+
     logging.info("IFC 4x3 file created: %s", output_file)
     logging.info("File size: %s bytes", output_path.stat().st_size)
     logging.info("Content: %d IfcCartesianPoint objects with SurveyData property sets", len(annotations))
@@ -269,43 +270,38 @@ def create_basic_ifc_with_survey_points(csv_file, output_file, transform_info=No
     
     return True
 
-def main():
-    """Test the simple IFC export"""
-    print("🚀 Simple CSV to IFC 4x3 Export")
-    print("=" * 50)
-    
-    # File paths
-    csv_file = Path("data/processed/client_survey_processed.csv")
-    transform_file = Path("data/processed/client_survey_processed_transform_info.json")
-    output_file = Path("data/output/client_survey_simple.ifc")
-    
-    if not csv_file.exists():
-        print(f"❌ CSV file not found: {csv_file}")
+def main(argv=None):
+    """Create IFC survey points at an explicit, caller-chosen output path."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("csv_file", type=Path, help="processed survey CSV")
+    parser.add_argument("output_file", type=Path, help="new IFC output path")
+    parser.add_argument(
+        "--transform-info",
+        type=Path,
+        help="JSON local-origin and CRS record produced alongside the processed CSV",
+    )
+    args = parser.parse_args(argv)
+    if not args.csv_file.is_file():
+        print(f"CSV file does not exist or is not a file: {args.csv_file}")
         return False
-    
-    # Load transformation info
+    if args.output_file.exists():
+        print(f"Refusing to overwrite existing IFC output: {args.output_file}")
+        return False
+
     transform_info = None
-    if transform_file.exists():
-        with open(transform_file, 'r') as f:
-            transform_info = json.load(f)
-        print(f"✅ Loaded transformation info")
-    
-    # Create IFC
-    success = create_basic_ifc_with_survey_points(csv_file, output_file, transform_info)
-    
+    if args.transform_info:
+        if not args.transform_info.is_file():
+            print(f"Transform info does not exist or is not a file: {args.transform_info}")
+            return False
+        transform_info = json.loads(args.transform_info.read_text(encoding="utf-8"))
+    success = create_basic_ifc_with_survey_points(
+        args.csv_file, args.output_file, transform_info
+    )
     if success:
-        print(f"\n🎉 Export completed successfully!")
-        print(f"📁 IFC file: {output_file}")
-        print(f"\n📚 Next steps:")
-        print(f"1. Open {output_file} in Blender with Bonsai addon")
-        print(f"2. Survey points appear as IfcCartesianPoint objects")
-        print(f"3. Each point has SurveyData property set with metadata")
-        print(f"4. Use points as snap targets for design modeling")
-        print(f"5. Model roads, terraces, utilities as additional IFC elements")
-    
+        print(f"IFC survey points written to: {args.output_file}")
     return success
 
 if __name__ == "__main__":
     import sys
-    success = main()
-    sys.exit(0 if success else 1)
+    sys.exit(0 if main() else 1)

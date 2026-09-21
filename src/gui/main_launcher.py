@@ -3,15 +3,11 @@ from __future__ import annotations
 import logging
 import sys
 
-from PyQt6 import QtWidgets
+from PyQt6 import QtCore, QtWidgets
 
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from scripts.gui.app_logging import open_logs_folder, setup_logging
-from scripts.gui.csv_to_ifc_app import CsvToIfcWindow
-from scripts.gui.ifc_to_landxml_app import IfcToLandxmlWindow
+from src.gui.csv_to_ifc_app import CsvToIfcWindow
+from src.gui.ifc_to_landxml_app import IfcToLandxmlWindow
+from src.utils.logging import open_logs_folder, setup_logging
 
 
 APP_NAME = "Benny Survey Toolkit"
@@ -20,6 +16,9 @@ APP_NAME = "Benny Survey Toolkit"
 class MainLauncher(QtWidgets.QWidget):
     def __init__(self) -> None:
         super().__init__()
+        # Qt does not parent top-level windows. Retain their Python wrappers so
+        # launched tools are not collected as soon as these methods return.
+        self._child_windows: list[QtWidgets.QWidget] = []
         self.setWindowTitle(APP_NAME)
         self.setMinimumWidth(400)
 
@@ -48,15 +47,23 @@ class MainLauncher(QtWidgets.QWidget):
 
     def launch_csv_app(self) -> None:
         csv_window = CsvToIfcWindow()
-        csv_window.show()
-        csv_window.activateWindow()
-        csv_window.raise_()
+        self._show_child_window(csv_window)
 
     def launch_landxml_app(self) -> None:
-        landxml_window = IfcToLandxmlWindow({"target_crs": {"epsg": 3006, "name": "SWEREF99 TM"}})
-        landxml_window.show()
-        landxml_window.activateWindow()
-        landxml_window.raise_()
+        landxml_window = IfcToLandxmlWindow()
+        self._show_child_window(landxml_window)
+
+    def _show_child_window(self, window: QtWidgets.QWidget) -> None:
+        window.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._child_windows.append(window)
+        window.destroyed.connect(lambda _object=None, child=window: self._discard_child_window(child))
+        window.show()
+        window.activateWindow()
+        window.raise_()
+
+    def _discard_child_window(self, window: QtWidgets.QWidget) -> None:
+        if window in self._child_windows:
+            self._child_windows.remove(window)
 
 
 def main() -> int:
@@ -72,5 +79,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-

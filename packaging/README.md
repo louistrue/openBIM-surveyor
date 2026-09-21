@@ -18,12 +18,12 @@ Two PyQt6 applications have been packaged:
 
 ### 2. IFC to LandXML Converter (`Benny IFC to LandXML.exe`)
 - **Purpose**: Converts IFC files (after modeling in Bonsai) to LandXML format
-- **Input**: IFC file with modeled surfaces and geometry
-- **Output**: LandXML 1.2 file compatible with machine control systems
+- **Input**: IFC with one selected `IfcGeographicElement` terrain and authored `IfcTriangulatedFaceSet`
+- **Output**: LandXML 1.2 terrain TIN for project-specific validation
 - **Features**:
-  - Extracts triangulated surfaces from IFC geometry
-  - Maintains coordinate system: SWEREF99 TM (EPSG:3006)
-  - Optional point and surface inclusion
+  - Requires the terrain GlobalId; it does not scan building geometry or loose IFC points
+  - Reads placement, units, projected CRS, and map conversion from IFC; it does not use a default CRS
+  - Preserves authored face topology and writes LandXML coordinates as N/E/Z
   - Comprehensive error logging
 
 ## Technical Details
@@ -32,7 +32,6 @@ Two PyQt6 applications have been packaged:
 - **ifcopenshell**: 0.8.3.post2 (IFC file processing)
 - **PyQt6**: 6.9.x (GUI framework)
 - **numpy**: 2.3.x (numerical operations)
-- **scipy**: 1.16.x (triangulation for LandXML)
 
 ### Build Configuration
 - **PyInstaller**: 6.16.0
@@ -64,7 +63,8 @@ Both applications feature comprehensive logging:
 3. **IFC → LandXML**:
    - Select the Bonsai-enhanced IFC file
    - Choose output location for LandXML
-   - Export for machine control systems
+   - Enter the GlobalId of the intended `IfcGeographicElement` terrain
+   - Export for review in the target project workflow; compatibility is not certified
 
 ### Error Handling
 If something goes wrong:
