@@ -192,9 +192,10 @@ class ClientWorkflowIntegrationTests(unittest.TestCase):
             self.assertIsInstance(failures[0], FileExistsError)
             persisted = json.loads((output_dir / "workflow_summary.json").read_text(encoding="utf-8"))
             self.assertEqual(persisted["input"], results[0]["input"])
-            self.assertFalse(
-                (output_dir / complete_client_workflow.INCOMPLETE_FILENAME).exists(),
-                "the completed workflow must release its exclusive reservation",
+            self.assertTrue((output_dir / complete_client_workflow.INCOMPLETE_FILENAME).is_file())
+            self.assertEqual(
+                complete_client_workflow.verify_workflow_completion(output_dir)["format"],
+                "bonsai-topo-workflow-completion-v1",
             )
 
     def test_destination_reservation_prevents_the_publish_time_directory_race(self) -> None:
@@ -228,7 +229,9 @@ class ClientWorkflowIntegrationTests(unittest.TestCase):
                 (output_dir / "artifact.txt").read_text(encoding="utf-8"),
                 "complete artifact\n",
             )
-            self.assertFalse((output_dir / complete_client_workflow.INCOMPLETE_FILENAME).exists())
+            self.assertTrue((output_dir / complete_client_workflow.INCOMPLETE_FILENAME).is_file())
+            self.assertTrue((output_dir / complete_client_workflow.COMPLETION_FILENAME).is_file())
+            complete_client_workflow.verify_workflow_completion(output_dir)
 
     @unittest.skipUnless(HAS_CSV_TO_IFC_DEPENDENCIES, "requires pandas and ifcopenshell")
     def test_failed_terrain_export_leaves_no_published_or_staged_artifacts(self) -> None:
@@ -308,8 +311,8 @@ class ClientWorkflowIntegrationTests(unittest.TestCase):
             finally:
                 complete_client_workflow.release_workflow_workspace(workspace)
 
-    def test_tampered_reservation_token_fails_closed_before_publication(self) -> None:
-        """The marker must bind publication to the run that created the workspace."""
+    def test_retained_reservation_is_provenance_not_the_ready_condition(self) -> None:
+        """Readiness comes from the immutable completion manifest, not marker removal."""
 
         with TemporaryDirectory() as directory:
             temporary = Path(directory)
@@ -319,10 +322,10 @@ class ClientWorkflowIntegrationTests(unittest.TestCase):
                 (workspace.staging / "workflow_summary.json").write_text("{}\n", encoding="utf-8")
                 workspace.reservation.write_text("token=forged\nstate=incomplete\n", encoding="ascii")
 
-                with self.assertRaisesRegex(RuntimeError, "marker token does not belong"):
-                    complete_client_workflow.publish_workflow_workspace(workspace)
-
-                self.assertFalse((workspace.destination / "artifact.txt").exists())
+                complete_client_workflow.publish_workflow_workspace(workspace)
+                completion = complete_client_workflow.verify_workflow_completion(workspace.destination)
+                self.assertEqual(completion["reservation_token"], workspace.reservation_token)
+                self.assertTrue((workspace.destination / "artifact.txt").is_file())
                 self.assertTrue(workspace.reservation.is_file())
             finally:
                 complete_client_workflow.release_workflow_workspace(workspace)
@@ -362,6 +365,128 @@ class ClientWorkflowIntegrationTests(unittest.TestCase):
             finally:
                 complete_client_workflow.release_workflow_workspace(workspace)
 
+    def test_staging_substitution_fails_before_a_completion_manifest_is_published(self) -> None:
+        """Regression for #5051: a replaced stage cannot become a ready handoff."""
+
+        with TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            workspace = complete_client_workflow.reserve_workflow_workspace(temporary / "output")
+            orphaned_stage = temporary / "orphaned-stage"
+            os.replace(workspace.staging, orphaned_stage)
+            workspace.staging.mkdir()
+            (workspace.staging / "artifact.txt").write_text("forged\n", encoding="utf-8")
+            (workspace.staging / "workflow_summary.json").write_text("{}\n", encoding="utf-8")
+
+            try:
+                with self.assertRaisesRegex(RuntimeError, "staging is no longer owned"):
+                    complete_client_workflow.publish_workflow_workspace(workspace)
+                self.assertFalse((workspace.destination / complete_client_workflow.COMPLETION_FILENAME).exists())
+                self.assertEqual((workspace.staging / "artifact.txt").read_text(encoding="utf-8"), "forged\n")
+            finally:
+                with self.assertRaisesRegex(RuntimeError, "staging is no longer owned"):
+                    complete_client_workflow.release_workflow_workspace(workspace)
+            self.assertTrue(orphaned_stage.is_dir())
+
+    def test_summary_injection_fails_before_completion_manifest_is_published(self) -> None:
+        """Regression for #5051: replacement of a linked summary prevents readiness."""
+
+        with TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            workspace = complete_client_workflow.reserve_workflow_workspace(temporary / "output")
+            try:
+                artifact = workspace.staging / "artifact.txt"
+                summary = workspace.staging / "workflow_summary.json"
+                artifact.write_text("ours\n", encoding="utf-8")
+                summary.write_text('{"ours": true}\n', encoding="utf-8")
+                forged = temporary / "forged-summary.json"
+                forged.write_text('{"forged": true}\n', encoding="utf-8")
+                original_link = complete_client_workflow.os.link
+
+                def replace_summary_after_link(source: Path, target: Path) -> None:
+                    original_link(source, target)
+                    if Path(source) == summary:
+                        os.replace(forged, workspace.destination / "workflow_summary.json")
+
+                with mock.patch.object(
+                    complete_client_workflow.os, "link", side_effect=replace_summary_after_link
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "does not match|changed while verifying"):
+                        complete_client_workflow.publish_workflow_workspace(workspace)
+
+                self.assertEqual(
+                    (workspace.destination / "workflow_summary.json").read_text(encoding="utf-8"),
+                    '{"forged": true}\n',
+                )
+                self.assertFalse((workspace.destination / complete_client_workflow.COMPLETION_FILENAME).exists())
+            finally:
+                complete_client_workflow.release_workflow_workspace(workspace)
+
+    def test_marker_path_substitution_never_deletes_external_content(self) -> None:
+        """Regression for #5051: no publication path unlinks a substituted marker."""
+
+        with TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            workspace = complete_client_workflow.reserve_workflow_workspace(temporary / "output")
+            try:
+                (workspace.staging / "artifact.txt").write_text("ours\n", encoding="utf-8")
+                (workspace.staging / "workflow_summary.json").write_text("{}\n", encoding="utf-8")
+                external = temporary / "external.txt"
+                external.write_text("external content\n", encoding="utf-8")
+                original_link = complete_client_workflow.os.link
+
+                def replace_marker_before_completion(source: Path, target: Path) -> None:
+                    original_link(source, target)
+                    if Path(source).name == "workflow_summary.json":
+                        try:
+                            os.replace(external, workspace.reservation)
+                        except PermissionError:
+                            # The retained Windows descriptor denies the swap outright.
+                            pass
+
+                with mock.patch.object(
+                    complete_client_workflow.os, "link", side_effect=replace_marker_before_completion
+                ):
+                    complete_client_workflow.publish_workflow_workspace(workspace)
+
+                if external.exists():
+                    self.assertEqual(external.read_text(encoding="utf-8"), "external content\n")
+                else:
+                    self.assertEqual(workspace.reservation.read_text(encoding="utf-8"), "external content\n")
+                complete_client_workflow.verify_workflow_completion(workspace.destination)
+            finally:
+                complete_client_workflow.release_workflow_workspace(workspace)
+
+    def test_windows_marker_swap_never_reopens_or_follows_the_marker_path(self) -> None:
+        """Regression for #5051: the retained fd survives a Windows-style marker swap."""
+
+        with TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            workspace = complete_client_workflow.reserve_workflow_workspace(temporary / "output")
+            try:
+                external = temporary / "external-marker"
+                external.write_text("external content\n", encoding="utf-8")
+                original_marker = temporary / "original-marker"
+                try:
+                    os.replace(workspace.reservation, original_marker)
+                    os.symlink(external, workspace.reservation)
+                except PermissionError:
+                    # Windows denies replacement while the retained descriptor is open.
+                    self.assertTrue(workspace.reservation.is_file())
+                original_open = complete_client_workflow.os.open
+
+                def reject_marker_reopen(path: Path, flags: int, mode: int = 0o777) -> int:
+                    if Path(path) == workspace.reservation:
+                        raise AssertionError("the marker path must not be reopened")
+                    return original_open(path, flags, mode)
+
+                with mock.patch.object(complete_client_workflow.os, "name", "nt"), mock.patch.object(
+                    complete_client_workflow.os, "O_NOFOLLOW", None, create=True
+                ), mock.patch.object(complete_client_workflow.os, "open", side_effect=reject_marker_reopen):
+                    complete_client_workflow._verify_owned_marker(workspace)
+                self.assertEqual(external.read_text(encoding="utf-8"), "external content\n")
+            finally:
+                complete_client_workflow.release_workflow_workspace(workspace)
+
     def test_staging_substitution_is_left_for_manual_inspection(self) -> None:
         """Regression for #5051: cleanup only removes the staging directory this run owns."""
 
@@ -382,8 +507,8 @@ class ClientWorkflowIntegrationTests(unittest.TestCase):
                 "external content\n",
             )
 
-    def test_summary_is_linked_last_and_clears_the_incomplete_marker_on_success(self) -> None:
-        """Consumers can require summary present and the incomplete marker absent."""
+    def test_completion_manifest_is_linked_last_and_verifies_success(self) -> None:
+        """Consumers require the hash-verified completion manifest, not marker absence."""
 
         with TemporaryDirectory() as directory:
             temporary = Path(directory)
@@ -401,9 +526,14 @@ class ClientWorkflowIntegrationTests(unittest.TestCase):
                 with mock.patch.object(complete_client_workflow.os, "link", side_effect=record_link):
                     complete_client_workflow.publish_workflow_workspace(workspace)
 
-                self.assertEqual(targets[-1].name, "workflow_summary.json")
+                self.assertEqual(targets[-1].name, complete_client_workflow.COMPLETION_FILENAME)
                 self.assertTrue((workspace.destination / "workflow_summary.json").is_file())
-                self.assertFalse(workspace.reservation.exists())
+                self.assertTrue(workspace.reservation.is_file())
+                completion = complete_client_workflow.verify_workflow_completion(workspace.destination)
+                self.assertEqual(
+                    [record["name"] for record in completion["artifacts"]],
+                    ["artifact.txt", "workflow_summary.json"],
+                )
             finally:
                 complete_client_workflow.release_workflow_workspace(workspace)
 

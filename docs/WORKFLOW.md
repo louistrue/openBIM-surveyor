@@ -14,22 +14,29 @@ Omitting `--output-dir` publishes to a new temporary directory. An explicit
 tracked `data/processed` and `data/output` directories. It claims the requested
 directory with an atomic create before staging, writes every artifact to a
 private sibling staging directory, then promotes complete files without
-replacement. `workflow_summary.json` is promoted last and is the ready marker
-for consumers. Portable Python has no no-replace whole-directory rename, so
-the directory name is reserved while the work runs rather than appearing only
-at completion. A handoff is ready only if the summary exists and the hidden
-`.bonsai-topo-workflow-incomplete` marker is absent. On any failure, that
-marker and any partial destination files remain for manual inspection; only the
-private sibling staging directory is cleaned automatically. This deliberately
-avoids deleting destination paths after a failed publication.
+replacement. A separate `.complete.json` manifest is promoted last and records
+the hash and byte size of every artifact, including `workflow_summary.json`.
+Portable Python has no no-replace whole-directory rename, so the directory name
+is reserved while the work runs rather than appearing only at completion. A
+handoff is ready only if `.complete.json` exists and every listed file verifies
+against its SHA-256 and size. The summary is an ordinary verified artifact, not
+a ready marker. The hidden `.bonsai-topo-workflow-incomplete` marker remains as
+provenance and is never removed. On any failure, that marker and any partial
+destination files remain for manual inspection; only the still-owned private
+sibling staging directory is cleaned automatically. This deliberately avoids
+deleting destination paths after a failed publication.
 
-The marker is exclusively created with a per-run random token and checked as
-the same regular file before publish. Platforms with `O_NOFOLLOW` use it;
-Windows uses exclusive creation plus an identity/token check and rejects an
-existing marker or reparse point. This is a cooperative-writer safety protocol,
-not an authenticity boundary against a principal that can modify the output
-directory. Consumers must use the ready condition above, and deployment must
-protect the destination directory with appropriate storage permissions.
+The marker is exclusively created with a per-run random token; its original
+descriptor stays open for the run and the workflow never reopens, follows,
+removes, or replaces its path. Platforms with `O_NOFOLLOW` use it for staged
+artifact reads. Windows uses exclusive creation and descriptor/path identity
+checks where no no-follow flag is exposed. Each staged artifact is hashed while
+its descriptor is open; its no-replace destination hard link is compared to
+that source before the final manifest is eligible for publication. This is a
+cooperative-writer safety protocol, not an authenticity boundary against a
+same-user principal that can modify the output directory. Consumers must verify
+the completion manifest and deployment must protect the destination directory
+with appropriate storage permissions.
 
 The input layout is semicolon-delimited:
 

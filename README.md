@@ -29,26 +29,33 @@ The command refuses `data/processed` and `data/output`, so it does not replace
 tracked sample outputs. An explicit output directory must be new; the workflow
 claims that directory with an atomic create before it starts, then builds its
 files in private sibling staging. Completed artifacts are promoted one at a
-time without replacement, with `workflow_summary.json` last as the ready
-marker. This is deliberately not described as an atomic whole-directory rename:
-portable Python has no no-replace directory-rename primitive. A destination is
-ready only when `workflow_summary.json` exists and the hidden
-`.bonsai-topo-workflow-incomplete` marker is absent. On any failure, the
-marker and any partial destination artifacts remain for inspection; only the
-private staging directory is removed automatically. This avoids deleting a
-path that another process might have substituted. The summary records the
-local origin and declared CRS. The IFC uses metre project and map units and
-carries local and reconstructed projected coordinates in its `SurveyData`
-property sets.
+time without replacement. A final `.complete.json` manifest records the
+per-artifact SHA-256 hashes and byte sizes and is promoted last. This is
+deliberately not described as an atomic whole-directory rename: portable Python
+has no no-replace directory-rename primitive. A destination is ready only when
+`.complete.json` is present *and* every artifact it lists matches its recorded
+hash and size (use `verify_workflow_completion` when embedding this workflow).
+`workflow_summary.json` is an ordinary verified artifact, not a ready marker.
+The hidden `.bonsai-topo-workflow-incomplete` marker remains permanently as
+reservation provenance and is never removed or used as a negative readiness
+signal. On any failure, all destination paths remain for inspection; only the
+still-owned private staging directory is removed automatically. This avoids
+deleting a path that another process might have substituted. The summary
+records the local origin and declared CRS. The IFC uses metre project and map
+units and carries local and reconstructed projected coordinates in its
+`SurveyData` property sets.
 
 The reservation marker has a per-run random token and is created exclusively
-without following symlinks where the platform supports it. Windows uses its
-exclusive-create (`O_EXCL`) semantics plus a regular-file identity and token
-check; a pre-existing marker or reparse point fails the run rather than being
-opened. These checks protect cooperative workflow writers and reject detected
-substitution. They are not an authenticity boundary against a principal that
-can freely modify the output directory: consumers must require the ready
-condition above and project storage permissions must protect deliverables.
+without following symlinks where the platform supports it. Its original file
+descriptor remains open for the run, so the workflow never reopens, follows,
+removes, or replaces the marker path (including on Windows). Every staged file
+is opened without following links where available, hashed while its descriptor
+is open, hard-linked without replacement, and compared against that trusted
+source before the completion manifest can be published. The final manifest
+lets consumers detect later artifact substitution by verifying all hashes.
+This is a cooperative-concurrency protocol, not an authenticity boundary
+against a same-user principal that can modify the destination directory or its
+contents; storage permissions must protect deliverables.
 
 ## Terrain LandXML is a separate, explicit handoff
 

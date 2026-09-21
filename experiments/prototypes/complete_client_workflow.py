@@ -10,6 +10,7 @@ explicitly identifies that terrain's GlobalId.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import secrets
@@ -51,7 +52,20 @@ class WorkflowWorkspace:
     reservation: Path
     reservation_identity: tuple[int, int]
     reservation_token: str
+    reservation_descriptor: int
     published: bool = False
+
+
+@dataclass(frozen=True)
+class TrustedStagedArtifact:
+    """A staged regular file held open while its published link is verified."""
+
+    path: Path
+    name: str
+    descriptor: int
+    identity: tuple[int, int]
+    size: int
+    sha256: str
 
 
 def default_config() -> dict[str, Any]:
@@ -88,6 +102,7 @@ def resolve_output_directory(requested: Path | None) -> Path:
 
 
 INCOMPLETE_FILENAME = ".bonsai-topo-workflow-incomplete"
+COMPLETION_FILENAME = ".complete.json"
 
 
 def _identity(stat_result: os.stat_result) -> tuple[int, int]:
@@ -107,7 +122,9 @@ def _marker_open_flags(*, writable: bool) -> int:
     marker write through a symlink.
     """
 
-    flags = os.O_WRONLY if writable else os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    flags = (os.O_WRONLY if writable else os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)) | getattr(
+        os, "O_BINARY", 0
+    )
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if no_follow is not None:
         return flags | no_follow
@@ -116,8 +133,20 @@ def _marker_open_flags(*, writable: bool) -> int:
     raise RuntimeError("This platform cannot open workflow markers without following symlinks.")
 
 
-def _create_owned_marker(marker: Path, token: str) -> tuple[int, int]:
-    """Create an incomplete marker exclusively and bind it to ``token``."""
+def _read_file_flags() -> int:
+    """Return no-follow read flags, or the Windows identity-check fallback."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is not None:
+        return flags | no_follow
+    if os.name == "nt":
+        return flags
+    raise RuntimeError("This platform cannot read workflow files without following symlinks.")
+
+
+def _create_owned_marker(marker: Path, token: str) -> tuple[int, tuple[int, int]]:
+    """Create an incomplete marker and retain its original descriptor for this run."""
 
     flags = _marker_open_flags(writable=True) | os.O_CREAT | os.O_EXCL
     descriptor = os.open(marker, flags, 0o600)
@@ -134,33 +163,182 @@ def _create_owned_marker(marker: Path, token: str) -> tuple[int, int]:
             written += count
         os.fsync(descriptor)
         identity = _identity(descriptor_stat)
-    finally:
+        marker_stat = os.lstat(marker)
+        if not stat.S_ISREG(marker_stat.st_mode) or _identity(marker_stat) != identity:
+            raise RuntimeError("Workflow marker ownership could not be verified after creation.")
+        return descriptor, identity
+    except BaseException:
         os.close(descriptor)
-
-    marker_stat = os.lstat(marker)
-    if not stat.S_ISREG(marker_stat.st_mode) or _identity(marker_stat) != identity:
-        raise RuntimeError("Workflow marker ownership could not be verified after creation.")
-    return identity
+        raise
 
 
 def _verify_owned_marker(workspace: WorkflowWorkspace) -> None:
-    """Verify this exact regular marker and its random token without following links."""
+    """Verify the originally-created marker descriptor without reopening its path."""
 
-    marker_stat = os.lstat(workspace.reservation)
-    if not stat.S_ISREG(marker_stat.st_mode) or _identity(marker_stat) != workspace.reservation_identity:
-        raise RuntimeError(f"Workflow destination is no longer owned by this run: {workspace.destination}")
-
-    descriptor = os.open(workspace.reservation, _marker_open_flags(writable=False))
     try:
-        descriptor_stat = os.fstat(descriptor)
+        descriptor_stat = os.fstat(workspace.reservation_descriptor)
         if _identity(descriptor_stat) != workspace.reservation_identity:
             raise RuntimeError(f"Workflow destination is no longer owned by this run: {workspace.destination}")
-        payload = os.read(descriptor, 512).decode("ascii")
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            raise RuntimeError(f"Workflow reservation descriptor is not regular: {workspace.destination}")
+    except OSError as exc:
+        raise RuntimeError(f"Workflow destination is no longer owned by this run: {workspace.destination}") from exc
+
+
+def _verify_owned_staging(workspace: WorkflowWorkspace) -> None:
+    """Reject a substituted staging directory before touching one of its paths."""
+
+    staging_stat = os.lstat(workspace.staging)
+    if not stat.S_ISDIR(staging_stat.st_mode) or _identity(staging_stat) != workspace.staging_identity:
+        raise RuntimeError("Workflow staging is no longer owned by this run; it was left untouched.")
+
+
+def _hash_descriptor(descriptor: int) -> str:
+    """Return a SHA-256 digest from the beginning of an already-open file."""
+
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _open_trusted_staged_artifact(workspace: WorkflowWorkspace, artifact: Path) -> TrustedStagedArtifact:
+    """Open and hash one unmodified regular staged file without following links."""
+
+    _verify_owned_staging(workspace)
+    source_stat = os.lstat(artifact)
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise RuntimeError(f"Workflow staging contains an unsafe artifact: {artifact}")
+    descriptor = os.open(artifact, _read_file_flags())
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        identity = _identity(descriptor_stat)
+        if not stat.S_ISREG(descriptor_stat.st_mode) or identity != _identity(source_stat):
+            raise RuntimeError(f"Workflow staged artifact changed while opening: {artifact}")
+        digest = _hash_descriptor(descriptor)
+        if descriptor_stat.st_size != os.lseek(descriptor, 0, os.SEEK_END):
+            raise RuntimeError(f"Workflow staged artifact changed while hashing: {artifact}")
+        _verify_owned_staging(workspace)
+        current_stat = os.lstat(artifact)
+        if not stat.S_ISREG(current_stat.st_mode) or _identity(current_stat) != identity:
+            raise RuntimeError(f"Workflow staged artifact changed while hashing: {artifact}")
+        return TrustedStagedArtifact(
+            artifact, artifact.name, descriptor, identity, descriptor_stat.st_size, digest
+        )
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _hash_destination_against_source(destination: Path, source: TrustedStagedArtifact) -> None:
+    """Require the no-replace destination link to match the still-open source exactly."""
+
+    destination_stat = os.lstat(destination)
+    if not stat.S_ISREG(destination_stat.st_mode) or _identity(destination_stat) != source.identity:
+        raise RuntimeError(f"Published artifact does not match its trusted staged source: {destination}")
+    if destination_stat.st_size != source.size:
+        raise RuntimeError(f"Published artifact size does not match its trusted staged source: {destination}")
+    descriptor = os.open(destination, _read_file_flags())
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        if _identity(descriptor_stat) != source.identity or descriptor_stat.st_size != source.size:
+            raise RuntimeError(f"Published artifact changed while verifying: {destination}")
+        if _hash_descriptor(descriptor) != source.sha256:
+            raise RuntimeError(f"Published artifact hash does not match its trusted staged source: {destination}")
+        current_stat = os.lstat(destination)
+        if not stat.S_ISREG(current_stat.st_mode) or _identity(current_stat) != source.identity:
+            raise RuntimeError(f"Published artifact changed while verifying: {destination}")
     finally:
         os.close(descriptor)
-    expected = f"token={workspace.reservation_token}\nstate=incomplete\n"
-    if payload != expected:
-        raise RuntimeError(f"Workflow destination marker token does not belong to this run: {workspace.destination}")
+
+
+def _read_verified_regular_file(path: Path) -> bytes:
+    """Read one regular path, rejecting a link or a detected replacement race."""
+
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError(f"Workflow completion references an unsafe artifact: {path}")
+    descriptor = os.open(path, _read_file_flags())
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or _identity(opened) != _identity(before):
+            raise RuntimeError(f"Workflow artifact changed while opening: {path}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.lstat(path)
+        if not stat.S_ISREG(after.st_mode) or _identity(after) != _identity(opened):
+            raise RuntimeError(f"Workflow artifact changed while reading: {path}")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def verify_workflow_completion(destination: Path) -> dict[str, object]:
+    """Verify the positive ready condition for a published workflow directory.
+
+    A destination is ready only when this function accepts its last-published
+    completion manifest and every listed artifact's size and SHA-256 digest.
+    The retained incomplete marker is provenance, not a readiness signal.
+    """
+
+    destination = destination.resolve()
+    completion_path = destination / COMPLETION_FILENAME
+    try:
+        completion = json.loads(_read_verified_regular_file(completion_path).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Workflow completion manifest is invalid: {completion_path}") from exc
+    if not isinstance(completion, dict) or completion.get("format") != "bonsai-topo-workflow-completion-v1":
+        raise RuntimeError(f"Workflow completion manifest has an unsupported format: {completion_path}")
+    token = completion.get("reservation_token")
+    records = completion.get("artifacts")
+    if not isinstance(token, str) or len(token) != 64 or not isinstance(records, list) or not records:
+        raise RuntimeError(f"Workflow completion manifest is incomplete: {completion_path}")
+
+    names: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            raise RuntimeError(f"Workflow completion manifest has an invalid artifact record: {completion_path}")
+        name = record.get("name")
+        expected_hash = record.get("sha256")
+        expected_size = record.get("size")
+        if (
+            not isinstance(name, str)
+            or Path(name).name != name
+            or name in {"", ".", "..", COMPLETION_FILENAME, INCOMPLETE_FILENAME}
+            or name in names
+            or not isinstance(expected_hash, str)
+            or len(expected_hash) != 64
+            or not isinstance(expected_size, int)
+            or expected_size < 0
+        ):
+            raise RuntimeError(f"Workflow completion manifest has an invalid artifact record: {completion_path}")
+        names.add(name)
+        payload = _read_verified_regular_file(destination / name)
+        if len(payload) != expected_size or hashlib.sha256(payload).hexdigest() != expected_hash:
+            raise RuntimeError(f"Workflow artifact fails completion verification: {destination / name}")
+    return completion
+
+
+def _verify_completion_records(destination: Path, records: list[dict[str, object]]) -> None:
+    """Fail before readiness if a previously linked artifact was replaced."""
+
+    for record in records:
+        name = record["name"]
+        expected_hash = record["sha256"]
+        expected_size = record["size"]
+        if not isinstance(name, str) or not isinstance(expected_hash, str) or not isinstance(expected_size, int):
+            raise RuntimeError("Workflow has an invalid internal completion record.")
+        payload = _read_verified_regular_file(destination / name)
+        if len(payload) != expected_size or hashlib.sha256(payload).hexdigest() != expected_hash:
+            raise RuntimeError(f"Published artifact changed before completion: {destination / name}")
 
 
 def reserve_workflow_workspace(destination: Path) -> WorkflowWorkspace:
@@ -182,7 +360,7 @@ def reserve_workflow_workspace(destination: Path) -> WorkflowWorkspace:
     token = secrets.token_hex(32)
 
     try:
-        identity = _create_owned_marker(reservation, token)
+        reservation_descriptor, identity = _create_owned_marker(reservation, token)
         staging = Path(
             tempfile.mkdtemp(
                 prefix=f".{destination.name}.bonsai-topo-stage-",
@@ -194,22 +372,33 @@ def reserve_workflow_workspace(destination: Path) -> WorkflowWorkspace:
             raise RuntimeError("Workflow staging is not a private directory.")
         staging_identity = _identity(staging_stat)
     except BaseException:
+        if "reservation_descriptor" in locals():
+            os.close(reservation_descriptor)
         # The destination is an explicit incomplete handoff. Never remove it:
         # another process may have placed evidence there after reservation.
         raise
-    return WorkflowWorkspace(destination, staging, staging_identity, reservation, identity, token)
+    return WorkflowWorkspace(
+        destination,
+        staging,
+        staging_identity,
+        reservation,
+        identity,
+        token,
+        reservation_descriptor,
+    )
 
 
 def release_workflow_workspace(workspace: WorkflowWorkspace) -> None:
     """Remove private staging only; incomplete destinations require inspection."""
 
     try:
-        staging_stat = os.lstat(workspace.staging)
-    except FileNotFoundError:
-        return
-    if not stat.S_ISDIR(staging_stat.st_mode) or _identity(staging_stat) != workspace.staging_identity:
-        raise RuntimeError("Workflow staging is no longer owned by this run; it was left untouched.")
-    shutil.rmtree(workspace.staging)
+        try:
+            _verify_owned_staging(workspace)
+        except FileNotFoundError:
+            return
+        shutil.rmtree(workspace.staging)
+    finally:
+        os.close(workspace.reservation_descriptor)
 
 
 def publish_workflow_workspace(workspace: WorkflowWorkspace) -> None:
@@ -218,31 +407,72 @@ def publish_workflow_workspace(workspace: WorkflowWorkspace) -> None:
     There is no cross-platform directory equivalent of ``rename(...,
     NOREPLACE)``. The destination directory was atomically reserved before
     work began, and each same-filesystem staged artifact is linked into it with
-    ``os.link`` (which fails if the target already exists). The summary is
-    promoted last, so its presence is the ready marker for consumers.
+    ``os.link`` (which fails if the target already exists). A hash manifest is
+    linked last, so its verified presence is the ready condition for consumers.
     """
 
     _verify_owned_marker(workspace)
 
+    _verify_owned_staging(workspace)
     staged_artifacts = list(workspace.staging.iterdir())
     if not staged_artifacts:
         raise RuntimeError("Workflow staging directory contains no artifacts.")
     if not (workspace.staging / "workflow_summary.json").is_file():
         raise RuntimeError("Workflow staging is missing its required ready-marker summary.")
-    staged_artifacts.sort(key=lambda artifact: artifact.name == "workflow_summary.json")
+    if any(artifact.name == COMPLETION_FILENAME for artifact in staged_artifacts):
+        raise RuntimeError(f"Workflow staging must not pre-create {COMPLETION_FILENAME}.")
+
+    records: list[dict[str, object]] = []
+    for artifact in sorted(staged_artifacts, key=lambda candidate: candidate.name):
+        trusted = _open_trusted_staged_artifact(workspace, artifact)
+        try:
+            _verify_owned_staging(workspace)
+            current_stat = os.lstat(trusted.path)
+            if not stat.S_ISREG(current_stat.st_mode) or _identity(current_stat) != trusted.identity:
+                raise RuntimeError(f"Workflow staged artifact changed before publication: {trusted.path}")
+            target = workspace.destination / trusted.name
+            os.link(trusted.path, target)
+            _hash_destination_against_source(target, trusted)
+            records.append({"name": trusted.name, "sha256": trusted.sha256, "size": trusted.size})
+        finally:
+            os.close(trusted.descriptor)
+
+    _verify_owned_staging(workspace)
+    _verify_completion_records(workspace.destination, records)
+    completion_staging = workspace.staging / COMPLETION_FILENAME
+    completion = {
+        "format": "bonsai-topo-workflow-completion-v1",
+        "reservation_token": workspace.reservation_token,
+        "artifacts": records,
+    }
+    completion_bytes = (json.dumps(completion, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    descriptor = os.open(
+        completion_staging,
+        _marker_open_flags(writable=True) | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
     try:
-        for artifact in staged_artifacts:
-            if artifact.is_symlink() or not artifact.is_file():
-                raise RuntimeError(f"Workflow staging contains an unsafe artifact: {artifact}")
-            target = workspace.destination / artifact.name
-            os.link(artifact, target)
-    except BaseException as publish_error:
-        # Do not race an adversary by deciding that a destination entry is ours
-        # and unlinking it later. The incomplete marker remains, so consumers
-        # must not treat any partial artifacts as a ready handoff.
-        raise publish_error
+        written = 0
+        while written < len(completion_bytes):
+            count = os.write(descriptor, completion_bytes[written:])
+            if count <= 0:
+                raise OSError("Could not write workflow completion manifest.")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+    trusted_completion = _open_trusted_staged_artifact(workspace, completion_staging)
+    try:
+        _verify_owned_staging(workspace)
+        current_stat = os.lstat(trusted_completion.path)
+        if not stat.S_ISREG(current_stat.st_mode) or _identity(current_stat) != trusted_completion.identity:
+            raise RuntimeError("Workflow completion manifest changed before publication.")
+        os.link(trusted_completion.path, workspace.destination / COMPLETION_FILENAME)
+        _hash_destination_against_source(workspace.destination / COMPLETION_FILENAME, trusted_completion)
+    finally:
+        os.close(trusted_completion.descriptor)
     _verify_owned_marker(workspace)
-    workspace.reservation.unlink()
     workspace.published = True
 
 
@@ -254,6 +484,7 @@ def workflow_output_paths(output_dir: Path, stem: str, include_landxml: bool) ->
         "transform_info": output_dir / f"{stem}_processed_transform_info.json",
         "ifc": output_dir / f"{stem}_survey_points.ifc",
         "summary": output_dir / "workflow_summary.json",
+        "completion_manifest": output_dir / COMPLETION_FILENAME,
     }
     if include_landxml:
         outputs["landxml"] = output_dir / f"{stem}_terrain.xml"
