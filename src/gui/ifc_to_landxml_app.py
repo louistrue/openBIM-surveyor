@@ -1,63 +1,27 @@
 from __future__ import annotations
 
-import json
 import logging
 import sys
 import traceback
 from pathlib import Path
-from typing import Optional
 
-from PyQt6 import QtCore, QtWidgets
+from PyQt6 import QtWidgets
 
 from src.utils.logging import open_logs_folder, setup_logging
-from src.core.converters.ifc_to_landxml import LandXMLExporter
+from src.core.converters.ifc_to_landxml import (
+    LandXmlExportError,
+    export_ifc_terrain_to_landxml,
+)
 
 
 APP_NAME = "Benny IFC to LandXML"
 
 
-def load_coordinate_config() -> dict:
-    """Load coordinate configuration from multiple possible locations."""
-    possible_paths = [
-        # Relative to current working directory (when run from project root)
-        Path("config/coordinate_systems.json"),
-        # PyInstaller bundled data (when frozen)
-        Path(getattr(sys, '_MEIPASS', '.')) / "config" / "coordinate_systems.json",
-        # Relative to executable directory
-        Path(sys.executable).parent / "config" / "coordinate_systems.json",
-        # Relative to script directory (development)
-        Path(__file__).parent.parent.parent / "config" / "coordinate_systems.json",
-    ]
-    
-    for json_path in possible_paths:
-        if json_path.exists():
-            try:
-                with json_path.open("r", encoding="utf-8") as f:
-                    config = json.load(f)
-                    logging.info("Loaded coordinate config from: %s", json_path)
-                    return config
-            except Exception as exc:  # pragma: no cover - user environment issue
-                logging.exception("Failed to load coordinate config from %s: %s", json_path, exc)
-                continue
-    
-    logging.warning("No coordinate config found, using SWEREF99 TM defaults")
-    # Return default Swedish coordinate system
-    return {
-        "target_crs": {
-            "epsg": 3006,
-            "name": "SWEREF99 TM",
-            "description": "Swedish national coordinate reference system"
-        }
-    }
-
-
 class IfcToLandxmlWindow(QtWidgets.QWidget):
-    def __init__(self, coordinate_config: dict) -> None:
+    def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.setMinimumWidth(520)
-
-        self.coordinate_config = coordinate_config
 
         self.ifc_path_edit = QtWidgets.QLineEdit()
         self.ifc_path_edit.setPlaceholderText("Select IFC exported from Bonsai")
@@ -71,11 +35,10 @@ class IfcToLandxmlWindow(QtWidgets.QWidget):
         self.output_browse_button = QtWidgets.QPushButton("Browse…")
         self.output_browse_button.clicked.connect(self.select_output_file)
 
-        self.include_points_checkbox = QtWidgets.QCheckBox("Include points as CgPoints")
-        self.include_points_checkbox.setChecked(True)
-
-        self.include_surface_checkbox = QtWidgets.QCheckBox("Include triangulated surface")
-        self.include_surface_checkbox.setChecked(True)
+        self.terrain_global_id_edit = QtWidgets.QLineEdit()
+        self.terrain_global_id_edit.setPlaceholderText(
+            "Required: IfcGeographicElement GlobalId (not STEP id or name)"
+        )
 
         self.export_button = QtWidgets.QPushButton("Export LandXML")
         self.export_button.clicked.connect(self.export_landxml)
@@ -84,10 +47,8 @@ class IfcToLandxmlWindow(QtWidgets.QWidget):
         self.open_logs_button = QtWidgets.QPushButton("Open Logs Folder")
         self.open_logs_button.clicked.connect(open_logs_folder)
 
-        epsg = coordinate_config.get("target_crs", {}).get("epsg", "Unknown")
-        name = coordinate_config.get("target_crs", {}).get("name", "Local")
         self.status_label = QtWidgets.QLabel(
-            f"Coordinate system in output: {name} (EPSG:{epsg})"
+            "Output CRS and map units are read from the selected IFC IfcMapConversion; no default CRS is used."
         )
         self.status_label.setWordWrap(True)
 
@@ -100,8 +61,7 @@ class IfcToLandxmlWindow(QtWidgets.QWidget):
         layout.addLayout(
             self._build_file_row("Output LandXML", self.output_path_edit, self.output_browse_button)
         )
-        layout.addWidget(self.include_points_checkbox)
-        layout.addWidget(self.include_surface_checkbox)
+        layout.addLayout(self._build_text_row("Terrain GlobalId", self.terrain_global_id_edit))
 
         button_row = QtWidgets.QHBoxLayout()
         button_row.addWidget(self.export_button)
@@ -124,6 +84,14 @@ class IfcToLandxmlWindow(QtWidgets.QWidget):
         row.addWidget(label)
         row.addWidget(line_edit)
         row.addWidget(browse_button)
+        return row
+
+    def _build_text_row(self, label_text: str, line_edit: QtWidgets.QLineEdit) -> QtWidgets.QHBoxLayout:
+        row = QtWidgets.QHBoxLayout()
+        label = QtWidgets.QLabel(label_text)
+        label.setMinimumWidth(140)
+        row.addWidget(label)
+        row.addWidget(line_edit)
         return row
 
     def select_ifc_file(self) -> None:
@@ -154,12 +122,16 @@ class IfcToLandxmlWindow(QtWidgets.QWidget):
     def export_landxml(self) -> None:
         ifc_path = self.ifc_path_edit.text().strip()
         output_path = self.output_path_edit.text().strip()
+        terrain_global_id = self.terrain_global_id_edit.text().strip()
 
         if not ifc_path:
             self._show_error("Please select an input IFC file.")
             return
         if not output_path:
             self._show_error("Please choose an output LandXML file.")
+            return
+        if not terrain_global_id:
+            self._show_error("Please provide the selected terrain's IfcGeographicElement GlobalId.")
             return
 
         ifc_file = Path(ifc_path)
@@ -168,37 +140,36 @@ class IfcToLandxmlWindow(QtWidgets.QWidget):
             return
 
         output_file = Path(output_path)
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-
-        exporter = LandXMLExporter(self.coordinate_config)
-
         self.progress.show()
         self.export_button.setDisabled(True)
         self.status_label.setText("Exporting LandXML…")
         QtWidgets.QApplication.processEvents()
 
         try:
-            logging.info("Export start: IFC=%s -> LandXML=%s", ifc_file, output_file)
-            success = exporter.export_to_landxml(ifc_file, output_file)
+            logging.info("Export start: IFC=%s terrain=%s -> LandXML=%s", ifc_file, terrain_global_id, output_file)
+            mesh = export_ifc_terrain_to_landxml(
+                ifc_file,
+                output_file,
+                terrain_global_id=terrain_global_id,
+            )
+            logging.info("LandXML created successfully: %s", output_file)
+            self._show_info(
+                f"LandXML created successfully: {output_file}\n"
+                f"Terrain: {mesh.name}; points: {len(mesh.vertices_enz)}; faces: {len(mesh.faces)}."
+            )
 
-            if success:
-                logging.info("LandXML created successfully: %s", output_file)
-                self._show_info(f"LandXML created successfully: {output_file}")
-            else:
-                logging.error("LandXML export returned False")
-                self._show_error("LandXML export failed. Check logs for details.")
-
+        except LandXmlExportError as exc:  # pragma: no cover - user facing exception
+            logging.error("LandXML export rejected IFC: %s", exc)
+            self._show_error(str(exc))
         except Exception as exc:  # pragma: no cover - user facing exception
             logging.exception("Unhandled error during LandXML export: %s", exc)
-            self._show_error(
-                "An unexpected error occurred. Please check the log file for details."
-            )
+            self._show_error("An unexpected error occurred. Please check the log file for details.")
         finally:
             self.progress.hide()
             self.export_button.setEnabled(True)
-            epsg = self.coordinate_config.get("target_crs", {}).get("epsg", "Unknown")
-            name = self.coordinate_config.get("target_crs", {}).get("name", "Local")
-            self.status_label.setText(f"Coordinate system in output: {name} (EPSG:{epsg})")
+            self.status_label.setText(
+                "Output CRS and map units are read from the selected IFC IfcMapConversion; no default CRS is used."
+            )
 
     def _show_error(self, message: str) -> None:
         QtWidgets.QMessageBox.critical(self, "Error", message)
@@ -234,8 +205,7 @@ def main() -> int:
     logging.info("Log file located at %s", log_file)
     attach_excepthook(logging.getLogger(__name__))
 
-    coordinate_config = load_coordinate_config()
-    window = IfcToLandxmlWindow(coordinate_config)
+    window = IfcToLandxmlWindow()
     window.show()
 
     return_code = app.exec()
@@ -245,5 +215,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
 

@@ -4,9 +4,8 @@ Specialized processor for client survey data format
 Handles semicolon-separated values and specific column mapping
 """
 
+import argparse
 import pandas as pd
-import numpy as np
-from pyproj import Transformer
 import json
 from pathlib import Path
 
@@ -95,7 +94,7 @@ def process_client_csv(input_file, output_file, config):
         # Save processed CSV
         df_clean.to_csv(output_file, index=False)
         
-        print(f"✅ Processed {len(df_clean)} points -> {output_file}")
+        print(f"Processed {len(df_clean)} points -> {output_file}")
         print(f"Coordinate ranges after transformation:")
         print(f"  X: {df_clean['X'].min():.3f} to {df_clean['X'].max():.3f}")
         print(f"  Y: {df_clean['Y'].min():.3f} to {df_clean['Y'].max():.3f}")
@@ -112,6 +111,10 @@ def process_client_csv(input_file, output_file, config):
                 'y': float(origin_y),
                 'z': float(origin_z)
             },
+            'target_crs': {
+                'epsg': int(target_epsg),
+                'name': config['target_crs'].get('name', f'EPSG:{target_epsg}')
+            },
             'point_count': len(df_clean),
             'coordinate_ranges': {
                 'x_min': float(df_clean['X'].min()),
@@ -127,17 +130,17 @@ def process_client_csv(input_file, output_file, config):
         with open(transform_file, 'w') as f:
             json.dump(transform_info, f, indent=2)
         
-        print(f"✅ Transformation info saved: {transform_file}")
+        print(f"Transformation info saved: {transform_file}")
         
         return True
         
     except Exception as e:
-        print(f"❌ Error processing client CSV: {e}")
+        print(f"Error processing client CSV: {e}")
         return False
 
 def compare_with_reference(processed_file, reference_file):
     """Compare our processed output with the reference QGIS output"""
-    print(f"\n🔍 Comparing with reference output...")
+    print("\nComparing with reference output...")
     
     try:
         # Read both files
@@ -169,52 +172,43 @@ def compare_with_reference(processed_file, reference_file):
         span_diff_y = abs(our_span_y - ref_span_y)
         
         if span_diff_x < 1.0 and span_diff_y < 1.0:
-            print("✅ Coordinate spans match well - transformation is consistent")
+            print("Coordinate spans match well - transformation is consistent")
         else:
-            print("⚠️  Coordinate spans differ - may need adjustment")
+            print("Coordinate spans differ - may need adjustment")
         
         return True
         
     except Exception as e:
-        print(f"❌ Error comparing files: {e}")
+        print(f"Error comparing files: {e}")
         return False
 
-def main():
-    """Test with client data"""
-    print("🚀 Client Data Processing Test")
-    print("=" * 50)
-    
-    # File paths
-    input_file = Path("data/raw/client_survey.csv")
-    output_file = Path("data/processed/client_survey_processed.csv")
-    reference_file = Path("data/processed/reference_output.csv")
-    config_file = Path("config/coordinate_systems.json")
-    
-    # Check files exist
-    if not input_file.exists():
-        print(f"❌ Input file not found: {input_file}")
+def main(argv=None):
+    """Process one client CSV to an explicit output path."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input_file", type=Path)
+    parser.add_argument("output_file", type=Path)
+    parser.add_argument("--config", type=Path, help="coordinate-system JSON")
+    args = parser.parse_args(argv)
+    if not args.input_file.is_file():
+        print(f"Input file does not exist or is not a file: {args.input_file}")
         return False
-    
-    # Load config
-    if config_file.exists():
-        with open(config_file, 'r') as f:
-            config = json.load(f)
-    else:
-        # Default config for client data
-        config = {
-            "source_crs": {"epsg": 3006, "name": "SWEREF99 TM"},  # Common Swedish system
-            "target_crs": {"epsg": 3006, "name": "SWEREF99 TM"},  # Keep same for now
-            "local_origin": {"x": 0, "y": 0, "z": 0},
-            "precision": {"decimal_places": 3}
-        }
-    
-    # Process client data
-    success = process_client_csv(input_file, output_file, config)
-    
-    if success and reference_file.exists():
-        compare_with_reference(output_file, reference_file)
-    
-    return success
+    if args.output_file.exists():
+        print(f"Refusing to overwrite existing output: {args.output_file}")
+        return False
+
+    config = {
+        "source_crs": {"epsg": 3006, "name": "SWEREF99 TM"},
+        "target_crs": {"epsg": 3006, "name": "SWEREF99 TM"},
+        "local_origin": {"x": 0, "y": 0, "z": 0},
+        "precision": {"decimal_places": 3},
+    }
+    if args.config:
+        if not args.config.is_file():
+            print(f"Config file does not exist or is not a file: {args.config}")
+            return False
+        config = json.loads(args.config.read_text(encoding="utf-8"))
+    return process_client_csv(args.input_file, args.output_file, config)
 
 if __name__ == "__main__":
     import sys

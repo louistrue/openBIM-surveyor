@@ -283,7 +283,7 @@ def import_survey_points_to_ifc(csv_file, transform_info_file=None):
     print("1. Use points as snap targets for design modeling")
     print("2. Model roads, terraces, utilities as IFC elements")
     print("3. Export IFC 4x3 for BIM coordination")
-    print("4. Export surfaces as LandXML for machine control")
+    print("4. Export an authored terrain TIN to LandXML and validate it in the target project workflow")
 
 def main():
     """Main execution when run in Blender"""

@@ -2,12 +2,19 @@
 Inspect the IFC file to see what entities we actually created
 """
 
-import ifcopenshell
+try:
+    import ifcopenshell
+except ImportError:
+    ifcopenshell = None
 from pathlib import Path
 
 def inspect_ifc_file(ifc_path):
     """Inspect the contents of the IFC file"""
     print(f"🔍 Inspecting IFC file: {ifc_path}")
+
+    if ifcopenshell is None:
+        print("❌ IfcOpenShell is required to inspect IFC files")
+        return False
     
     if not Path(ifc_path).exists():
         print(f"❌ File not found: {ifc_path}")

@@ -7,6 +7,7 @@ without requiring external dependencies
 import csv
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 def test_project_structure():
     """Test that all required directories and files exist"""
@@ -172,8 +173,8 @@ def test_coordinate_transformation_logic():
         print(f"❌ Coordinates still too large (max: {max_coord:.3f})")
         return False
 
-def create_simple_landxml_example():
-    """Create a simple LandXML example without dependencies"""
+def create_simple_landxml_example(output_path):
+    """Create a simple LandXML example without mutating tracked samples."""
     print("\n🔍 Creating simple LandXML example...")
     
     # Simple XML structure
@@ -199,8 +200,7 @@ def create_simple_landxml_example():
   </Surfaces>
 </LandXML>'''
     
-    output_path = Path("data/output/example.xml")
-    output_path.parent.mkdir(exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(xml_content)
@@ -218,17 +218,19 @@ def main():
         ("Configuration", test_config_file),
         ("Example Data", test_example_data),
         ("Coordinate Logic", test_coordinate_transformation_logic),
-        ("LandXML Example", create_simple_landxml_example)
+        ("LandXML Example", None)
     ]
     
     results = []
-    for test_name, test_func in tests:
-        try:
-            result = test_func()
-            results.append((test_name, result))
-        except Exception as e:
-            print(f"❌ {test_name} failed with error: {e}")
-            results.append((test_name, False))
+    with TemporaryDirectory(prefix="bonsai-topo-basic-test-") as temp_dir:
+        tests[-1] = ("LandXML Example", lambda: create_simple_landxml_example(Path(temp_dir) / "example.xml"))
+        for test_name, test_func in tests:
+            try:
+                result = test_func()
+                results.append((test_name, result))
+            except Exception as e:
+                print(f"❌ {test_name} failed with error: {e}")
+                results.append((test_name, False))
     
     # Summary
     print("\n" + "=" * 50)
