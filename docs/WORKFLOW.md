@@ -135,6 +135,24 @@ IfcProject
 
 ## Quality Control
 
+### ifc-lite end-to-end federation control
+
+`fixtures/ifc-lite-control/` is the safe automation input for loading IFC,
+LandXML, and point-cloud representations of one survey into ifc-lite. It is
+synthetic, contains no customer data, and is separately dedicated under CC0.
+The independently stated `control.json` coordinates make unit, axis, origin,
+and double-georeferencing errors measurable to 1 mm.
+
+Run its dependency-free invariants before an interoperability test:
+
+```bash
+python -m unittest tests.unit.test_ifc_lite_control
+```
+
+Load `terrain.ifc`, `terrain.xml`, and `survey.xyz` through ifc-lite's normal
+multi-model load path. Do not copy `data/raw/client_survey.csv` or any
+`client_survey*` output into a public fixture corpus.
+
 ### Data Validation
 - Check coordinate ranges after transformation
 - Verify all required fields are present

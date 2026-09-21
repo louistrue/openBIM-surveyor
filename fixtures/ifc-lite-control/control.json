@@ -1,0 +1,20 @@
+{
+  "fixture": "bonsai-topo-ifc-lite-control-v1",
+  "synthetic": true,
+  "customerData": false,
+  "license": "CC0-1.0",
+  "horizontalCrs": "EPSG:3006",
+  "verticalDatum": "EPSG:5613",
+  "linearUnit": "metre",
+  "ifcMapOrigin": [500000.0, 6400000.0, 100.0],
+  "coordinateOrder": "easting,northing,elevation",
+  "toleranceMetres": 0.001,
+  "points": [
+    { "id": "CP1", "local": [0.0, 0.0, 0.0], "projected": [500000.0, 6400000.0, 100.0] },
+    { "id": "CP2", "local": [20.0, 0.0, 1.0], "projected": [500020.0, 6400000.0, 101.0] },
+    { "id": "CP3", "local": [0.0, 20.0, 2.0], "projected": [500000.0, 6400020.0, 102.0] },
+    { "id": "CP4", "local": [20.0, 20.0, 3.0], "projected": [500020.0, 6400020.0, 103.0] },
+    { "id": "CP5", "local": [10.0, 10.0, 1.5], "projected": [500010.0, 6400010.0, 101.5] }
+  ]
+}
+
