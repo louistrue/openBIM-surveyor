@@ -39,13 +39,14 @@ TRACKED_OUTPUT_DIRECTORIES = (
 )
 
 
-@dataclass(frozen=True)
+@dataclass
 class WorkflowWorkspace:
     """A private staging directory and exclusive reservation for one run."""
 
     destination: Path
     staging: Path
     reservation: Path
+    published: bool = False
 
 
 def default_config() -> dict[str, Any]:
@@ -63,8 +64,7 @@ def resolve_output_directory(requested: Path | None) -> Path:
     """Choose an as-yet-unpublished directory outside tracked sample outputs."""
 
     if requested is None:
-        # ``mkdtemp`` reserves a collision-free name. Remove its empty directory
-        # immediately: publication below is one atomic directory rename.
+        # ``mkdtemp`` gives the next reservation attempt a collision-free name.
         output_dir = Path(tempfile.mkdtemp(prefix="bonsai-topo-workflow-"))
         output_dir.rmdir()
         return output_dir
@@ -82,63 +82,110 @@ def resolve_output_directory(requested: Path | None) -> Path:
     return output_dir
 
 
-def _path_is_occupied(path: Path) -> bool:
-    """Include a dangling symlink, which ``Path.exists`` intentionally omits."""
-
-    return path.exists() or path.is_symlink()
-
-
-def _reservation_path(destination: Path) -> Path:
-    return destination.parent / f".{destination.name}.bonsai-topo-reservation"
+RESERVATION_FILENAME = ".bonsai-topo-workflow-reservation"
 
 
 def reserve_workflow_workspace(destination: Path) -> WorkflowWorkspace:
-    """Exclusively reserve a destination and create a private sibling staging dir."""
+    """Atomically claim a new destination and create a private sibling stage.
+
+    Creating the destination itself is the portable no-replace operation. A
+    separate lock beside a not-yet-created destination leaves a check/rename
+    window in which another caller can create that destination.
+    """
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    reservation = _reservation_path(destination)
     try:
-        descriptor = os.open(reservation, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        destination.mkdir(mode=0o700)
     except FileExistsError as exc:
         raise FileExistsError(
-            f"Another workflow is already preparing this output directory: {destination}."
+            f"Refusing to overwrite existing workflow output directory: {destination}"
         ) from exc
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        stream.write(f"pid={os.getpid()}\n")
+    reservation = destination / RESERVATION_FILENAME
 
     try:
-        if _path_is_occupied(destination):
-            raise FileExistsError(
-                f"Refusing to overwrite existing workflow output directory: {destination}"
-            )
+        reservation.write_text(f"pid={os.getpid()}\n", encoding="utf-8")
         staging = Path(
             tempfile.mkdtemp(
                 prefix=f".{destination.name}.bonsai-topo-stage-",
                 dir=destination.parent,
             )
         )
-    except BaseException:
+    except BaseException as setup_error:
         reservation.unlink(missing_ok=True)
-        raise
+        try:
+            destination.rmdir()
+        except OSError as cleanup_error:
+            raise RuntimeError(
+                "Workflow setup failed and the reserved destination could not be removed."
+            ) from cleanup_error
+        raise setup_error
     return WorkflowWorkspace(destination, staging, reservation)
 
 
 def release_workflow_workspace(workspace: WorkflowWorkspace) -> None:
-    """Remove only this run's private staging directory and reservation."""
+    """Remove private staging and an unpublished empty destination."""
 
     if workspace.staging.exists():
         shutil.rmtree(workspace.staging)
+    if workspace.published:
+        return
     workspace.reservation.unlink(missing_ok=True)
+    try:
+        workspace.destination.rmdir()
+    except FileNotFoundError:
+        return
+    except OSError as cleanup_error:
+        raise RuntimeError(
+            "Workflow failed and the reserved destination contains data that this run will not delete."
+        ) from cleanup_error
 
 
 def publish_workflow_workspace(workspace: WorkflowWorkspace) -> None:
-    """Atomically publish a completed run without replacing an existing output."""
+    """Publish staged files without replacing a destination or an artifact.
 
-    if _path_is_occupied(workspace.destination):
-        raise FileExistsError(
-            f"Refusing to overwrite existing workflow output directory: {workspace.destination}"
-        )
-    os.replace(workspace.staging, workspace.destination)
+    There is no cross-platform directory equivalent of ``rename(...,
+    NOREPLACE)``. The destination directory was atomically reserved before
+    work began, and each same-filesystem staged artifact is linked into it with
+    ``os.link`` (which fails if the target already exists). The summary is
+    promoted last, so its presence is the ready marker for consumers.
+    """
+
+    if not workspace.reservation.is_file():
+        raise RuntimeError(f"Workflow destination is no longer reserved: {workspace.destination}")
+
+    staged_artifacts = list(workspace.staging.iterdir())
+    if not staged_artifacts:
+        raise RuntimeError("Workflow staging directory contains no artifacts.")
+    if not (workspace.staging / "workflow_summary.json").is_file():
+        raise RuntimeError("Workflow staging is missing its required ready-marker summary.")
+    staged_artifacts.sort(key=lambda artifact: artifact.name == "workflow_summary.json")
+    published: list[tuple[Path, tuple[int, int]]] = []
+    try:
+        for artifact in staged_artifacts:
+            if artifact.is_symlink() or not artifact.is_file():
+                raise RuntimeError(f"Workflow staging contains an unsafe artifact: {artifact}")
+            target = workspace.destination / artifact.name
+            os.link(artifact, target)
+            target_stat = target.stat(follow_symlinks=False)
+            published.append((target, (target_stat.st_dev, target_stat.st_ino)))
+    except BaseException as publish_error:
+        cleanup_errors: list[OSError] = []
+        for target, identity in reversed(published):
+            try:
+                target_stat = target.stat(follow_symlinks=False)
+                if (target_stat.st_dev, target_stat.st_ino) == identity:
+                    target.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
+            raise RuntimeError(
+                "Workflow publication failed and could not remove every staged artifact."
+            ) from cleanup_errors[0]
+        raise publish_error
+    workspace.reservation.unlink()
+    workspace.published = True
 
 
 def workflow_output_paths(output_dir: Path, stem: str, include_landxml: bool) -> dict[str, Path]:

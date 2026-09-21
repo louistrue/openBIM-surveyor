@@ -11,11 +11,14 @@ python experiments/prototypes/complete_client_workflow.py input.csv \
 
 Omitting `--output-dir` publishes to a new temporary directory. An explicit
 `--output-dir` must not already exist. The command rejects the repository's
-tracked `data/processed` and `data/output` directories, reserves the requested
-destination exclusively, writes every artifact to a private sibling staging
-directory, and atomically publishes the directory only after the complete run
-succeeds. A failed run leaves no published partial CSV, IFC, LandXML, or
-summary artifacts.
+tracked `data/processed` and `data/output` directories. It claims the requested
+directory with an atomic create before staging, writes every artifact to a
+private sibling staging directory, then promotes complete files without
+replacement. `workflow_summary.json` is promoted last and is the ready marker
+for consumers. Portable Python has no no-replace whole-directory rename, so
+the directory name is reserved while the work runs rather than appearing only
+at completion. A failed run removes its empty reservation and private staging;
+it never deletes data it cannot prove it created.
 
 The input layout is semicolon-delimited:
 

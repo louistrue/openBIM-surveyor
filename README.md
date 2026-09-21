@@ -27,11 +27,15 @@ python experiments/prototypes/complete_client_workflow.py path/to/survey.csv \
 
 The command refuses `data/processed` and `data/output`, so it does not replace
 tracked sample outputs. An explicit output directory must be new; the workflow
-reserves it exclusively, builds its files in private staging, then atomically
-publishes the completed directory. A failed run leaves no partial published
-artifacts. The summary records the local origin and declared CRS. The IFC uses
-metre project and map units and carries local and reconstructed projected
-coordinates in its `SurveyData` property sets.
+claims that directory with an atomic create before it starts, then builds its
+files in private sibling staging. Completed artifacts are promoted one at a
+time without replacement, with `workflow_summary.json` last as the ready
+marker. This is deliberately not described as an atomic whole-directory rename:
+portable Python has no no-replace directory-rename primitive. A failed run
+removes its empty reservation and private staging; it never removes data it
+cannot prove it created. The summary records the local origin and declared CRS.
+The IFC uses metre project and map units and carries local and reconstructed
+projected coordinates in its `SurveyData` property sets.
 
 ## Terrain LandXML is a separate, explicit handoff
 

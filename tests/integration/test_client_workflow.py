@@ -83,7 +83,6 @@ class ClientWorkflowIntegrationTests(unittest.TestCase):
                 run_workflow(input_csv, output_dir, config=default_config())
 
             self.assertEqual(list(output_dir.iterdir()), [])
-            self.assertFalse((temporary / ".existing-output.bonsai-topo-reservation").exists())
 
     @unittest.skipUnless(HAS_CSV_TO_IFC_DEPENDENCIES, "requires pandas and ifcopenshell")
     def test_synthetic_csv_points_correspond_to_ifc_annotations_and_declared_crs(self) -> None:
@@ -193,9 +192,42 @@ class ClientWorkflowIntegrationTests(unittest.TestCase):
             persisted = json.loads((output_dir / "workflow_summary.json").read_text(encoding="utf-8"))
             self.assertEqual(persisted["input"], results[0]["input"])
             self.assertFalse(
-                (temporary / ".shared-output.bonsai-topo-reservation").exists(),
+                (output_dir / complete_client_workflow.RESERVATION_FILENAME).exists(),
                 "the completed workflow must release its exclusive reservation",
             )
+
+    def test_destination_reservation_prevents_the_publish_time_directory_race(self) -> None:
+        """Regression for #5051: a contender cannot create the destination after staging starts."""
+
+        with TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            output_dir = temporary / "reserved-output"
+            workspace = complete_client_workflow.reserve_workflow_workspace(output_dir)
+            staged_artifact = workspace.staging / "artifact.txt"
+            staged_artifact.write_text("complete artifact\n", encoding="utf-8")
+            (workspace.staging / "workflow_summary.json").write_text("{}\n", encoding="utf-8")
+            original_link = complete_client_workflow.os.link
+
+            def contend_for_destination(source: Path, target: Path) -> None:
+                with self.assertRaises(FileExistsError):
+                    output_dir.mkdir()
+                return original_link(source, target)
+
+            try:
+                with mock.patch.object(
+                    complete_client_workflow.os,
+                    "link",
+                    side_effect=contend_for_destination,
+                ):
+                    complete_client_workflow.publish_workflow_workspace(workspace)
+            finally:
+                complete_client_workflow.release_workflow_workspace(workspace)
+
+            self.assertEqual(
+                (output_dir / "artifact.txt").read_text(encoding="utf-8"),
+                "complete artifact\n",
+            )
+            self.assertFalse((output_dir / complete_client_workflow.RESERVATION_FILENAME).exists())
 
     @unittest.skipUnless(HAS_CSV_TO_IFC_DEPENDENCIES, "requires pandas and ifcopenshell")
     def test_failed_terrain_export_leaves_no_published_or_staged_artifacts(self) -> None:
@@ -222,7 +254,6 @@ class ClientWorkflowIntegrationTests(unittest.TestCase):
                     )
 
             self.assertFalse(output_dir.exists())
-            self.assertFalse((temporary / ".failed-output.bonsai-topo-reservation").exists())
             self.assertEqual(list(temporary.glob(".failed-output.bonsai-topo-stage-*")), [])
 
     def test_landxml_serialized_bytes_are_well_formed_and_declare_metre_units(self) -> None:
