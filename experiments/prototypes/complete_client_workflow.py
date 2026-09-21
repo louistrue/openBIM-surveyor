@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import shutil
+import stat
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -45,7 +47,10 @@ class WorkflowWorkspace:
 
     destination: Path
     staging: Path
+    staging_identity: tuple[int, int]
     reservation: Path
+    reservation_identity: tuple[int, int]
+    reservation_token: str
     published: bool = False
 
 
@@ -82,7 +87,80 @@ def resolve_output_directory(requested: Path | None) -> Path:
     return output_dir
 
 
-RESERVATION_FILENAME = ".bonsai-topo-workflow-reservation"
+INCOMPLETE_FILENAME = ".bonsai-topo-workflow-incomplete"
+
+
+def _identity(stat_result: os.stat_result) -> tuple[int, int]:
+    """Return the filesystem identity used to bind a marker to this run."""
+
+    return stat_result.st_dev, stat_result.st_ino
+
+
+def _marker_open_flags(*, writable: bool) -> int:
+    """Return flags that never follow a marker symlink where the OS supports it.
+
+    Windows does not expose ``O_NOFOLLOW`` in Python. Its ``O_CREAT | O_EXCL``
+    create is the safe fallback used here: an existing final path, including a
+    reparse point, is rejected rather than opened. The post-create ``lstat`` /
+    descriptor identity check below fails closed if that assumption is not met.
+    Other platforms without ``O_NOFOLLOW`` are rejected rather than risking a
+    marker write through a symlink.
+    """
+
+    flags = os.O_WRONLY if writable else os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is not None:
+        return flags | no_follow
+    if os.name == "nt":
+        return flags
+    raise RuntimeError("This platform cannot open workflow markers without following symlinks.")
+
+
+def _create_owned_marker(marker: Path, token: str) -> tuple[int, int]:
+    """Create an incomplete marker exclusively and bind it to ``token``."""
+
+    flags = _marker_open_flags(writable=True) | os.O_CREAT | os.O_EXCL
+    descriptor = os.open(marker, flags, 0o600)
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            raise RuntimeError("Workflow marker is not a regular file.")
+        payload = f"token={token}\nstate=incomplete\n".encode("ascii")
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:
+                raise OSError("Could not write workflow marker.")
+            written += count
+        os.fsync(descriptor)
+        identity = _identity(descriptor_stat)
+    finally:
+        os.close(descriptor)
+
+    marker_stat = os.lstat(marker)
+    if not stat.S_ISREG(marker_stat.st_mode) or _identity(marker_stat) != identity:
+        raise RuntimeError("Workflow marker ownership could not be verified after creation.")
+    return identity
+
+
+def _verify_owned_marker(workspace: WorkflowWorkspace) -> None:
+    """Verify this exact regular marker and its random token without following links."""
+
+    marker_stat = os.lstat(workspace.reservation)
+    if not stat.S_ISREG(marker_stat.st_mode) or _identity(marker_stat) != workspace.reservation_identity:
+        raise RuntimeError(f"Workflow destination is no longer owned by this run: {workspace.destination}")
+
+    descriptor = os.open(workspace.reservation, _marker_open_flags(writable=False))
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        if _identity(descriptor_stat) != workspace.reservation_identity:
+            raise RuntimeError(f"Workflow destination is no longer owned by this run: {workspace.destination}")
+        payload = os.read(descriptor, 512).decode("ascii")
+    finally:
+        os.close(descriptor)
+    expected = f"token={workspace.reservation_token}\nstate=incomplete\n"
+    if payload != expected:
+        raise RuntimeError(f"Workflow destination marker token does not belong to this run: {workspace.destination}")
 
 
 def reserve_workflow_workspace(destination: Path) -> WorkflowWorkspace:
@@ -100,44 +178,38 @@ def reserve_workflow_workspace(destination: Path) -> WorkflowWorkspace:
         raise FileExistsError(
             f"Refusing to overwrite existing workflow output directory: {destination}"
         ) from exc
-    reservation = destination / RESERVATION_FILENAME
+    reservation = destination / INCOMPLETE_FILENAME
+    token = secrets.token_hex(32)
 
     try:
-        reservation.write_text(f"pid={os.getpid()}\n", encoding="utf-8")
+        identity = _create_owned_marker(reservation, token)
         staging = Path(
             tempfile.mkdtemp(
                 prefix=f".{destination.name}.bonsai-topo-stage-",
                 dir=destination.parent,
             )
         )
-    except BaseException as setup_error:
-        reservation.unlink(missing_ok=True)
-        try:
-            destination.rmdir()
-        except OSError as cleanup_error:
-            raise RuntimeError(
-                "Workflow setup failed and the reserved destination could not be removed."
-            ) from cleanup_error
-        raise setup_error
-    return WorkflowWorkspace(destination, staging, reservation)
+        staging_stat = os.lstat(staging)
+        if not stat.S_ISDIR(staging_stat.st_mode):
+            raise RuntimeError("Workflow staging is not a private directory.")
+        staging_identity = _identity(staging_stat)
+    except BaseException:
+        # The destination is an explicit incomplete handoff. Never remove it:
+        # another process may have placed evidence there after reservation.
+        raise
+    return WorkflowWorkspace(destination, staging, staging_identity, reservation, identity, token)
 
 
 def release_workflow_workspace(workspace: WorkflowWorkspace) -> None:
-    """Remove private staging and an unpublished empty destination."""
+    """Remove private staging only; incomplete destinations require inspection."""
 
-    if workspace.staging.exists():
-        shutil.rmtree(workspace.staging)
-    if workspace.published:
-        return
-    workspace.reservation.unlink(missing_ok=True)
     try:
-        workspace.destination.rmdir()
+        staging_stat = os.lstat(workspace.staging)
     except FileNotFoundError:
         return
-    except OSError as cleanup_error:
-        raise RuntimeError(
-            "Workflow failed and the reserved destination contains data that this run will not delete."
-        ) from cleanup_error
+    if not stat.S_ISDIR(staging_stat.st_mode) or _identity(staging_stat) != workspace.staging_identity:
+        raise RuntimeError("Workflow staging is no longer owned by this run; it was left untouched.")
+    shutil.rmtree(workspace.staging)
 
 
 def publish_workflow_workspace(workspace: WorkflowWorkspace) -> None:
@@ -150,8 +222,7 @@ def publish_workflow_workspace(workspace: WorkflowWorkspace) -> None:
     promoted last, so its presence is the ready marker for consumers.
     """
 
-    if not workspace.reservation.is_file():
-        raise RuntimeError(f"Workflow destination is no longer reserved: {workspace.destination}")
+    _verify_owned_marker(workspace)
 
     staged_artifacts = list(workspace.staging.iterdir())
     if not staged_artifacts:
@@ -159,31 +230,18 @@ def publish_workflow_workspace(workspace: WorkflowWorkspace) -> None:
     if not (workspace.staging / "workflow_summary.json").is_file():
         raise RuntimeError("Workflow staging is missing its required ready-marker summary.")
     staged_artifacts.sort(key=lambda artifact: artifact.name == "workflow_summary.json")
-    published: list[tuple[Path, tuple[int, int]]] = []
     try:
         for artifact in staged_artifacts:
             if artifact.is_symlink() or not artifact.is_file():
                 raise RuntimeError(f"Workflow staging contains an unsafe artifact: {artifact}")
             target = workspace.destination / artifact.name
             os.link(artifact, target)
-            target_stat = target.stat(follow_symlinks=False)
-            published.append((target, (target_stat.st_dev, target_stat.st_ino)))
     except BaseException as publish_error:
-        cleanup_errors: list[OSError] = []
-        for target, identity in reversed(published):
-            try:
-                target_stat = target.stat(follow_symlinks=False)
-                if (target_stat.st_dev, target_stat.st_ino) == identity:
-                    target.unlink()
-            except FileNotFoundError:
-                continue
-            except OSError as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-        if cleanup_errors:
-            raise RuntimeError(
-                "Workflow publication failed and could not remove every staged artifact."
-            ) from cleanup_errors[0]
+        # Do not race an adversary by deciding that a destination entry is ours
+        # and unlinking it later. The incomplete marker remains, so consumers
+        # must not treat any partial artifacts as a ready handoff.
         raise publish_error
+    _verify_owned_marker(workspace)
     workspace.reservation.unlink()
     workspace.published = True
 

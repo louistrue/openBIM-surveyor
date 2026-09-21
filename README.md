@@ -31,11 +31,24 @@ claims that directory with an atomic create before it starts, then builds its
 files in private sibling staging. Completed artifacts are promoted one at a
 time without replacement, with `workflow_summary.json` last as the ready
 marker. This is deliberately not described as an atomic whole-directory rename:
-portable Python has no no-replace directory-rename primitive. A failed run
-removes its empty reservation and private staging; it never removes data it
-cannot prove it created. The summary records the local origin and declared CRS.
-The IFC uses metre project and map units and carries local and reconstructed
-projected coordinates in its `SurveyData` property sets.
+portable Python has no no-replace directory-rename primitive. A destination is
+ready only when `workflow_summary.json` exists and the hidden
+`.bonsai-topo-workflow-incomplete` marker is absent. On any failure, the
+marker and any partial destination artifacts remain for inspection; only the
+private staging directory is removed automatically. This avoids deleting a
+path that another process might have substituted. The summary records the
+local origin and declared CRS. The IFC uses metre project and map units and
+carries local and reconstructed projected coordinates in its `SurveyData`
+property sets.
+
+The reservation marker has a per-run random token and is created exclusively
+without following symlinks where the platform supports it. Windows uses its
+exclusive-create (`O_EXCL`) semantics plus a regular-file identity and token
+check; a pre-existing marker or reparse point fails the run rather than being
+opened. These checks protect cooperative workflow writers and reject detected
+substitution. They are not an authenticity boundary against a principal that
+can freely modify the output directory: consumers must require the ready
+condition above and project storage permissions must protect deliverables.
 
 ## Terrain LandXML is a separate, explicit handoff
 

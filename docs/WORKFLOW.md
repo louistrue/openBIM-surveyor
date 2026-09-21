@@ -17,8 +17,19 @@ private sibling staging directory, then promotes complete files without
 replacement. `workflow_summary.json` is promoted last and is the ready marker
 for consumers. Portable Python has no no-replace whole-directory rename, so
 the directory name is reserved while the work runs rather than appearing only
-at completion. A failed run removes its empty reservation and private staging;
-it never deletes data it cannot prove it created.
+at completion. A handoff is ready only if the summary exists and the hidden
+`.bonsai-topo-workflow-incomplete` marker is absent. On any failure, that
+marker and any partial destination files remain for manual inspection; only the
+private sibling staging directory is cleaned automatically. This deliberately
+avoids deleting destination paths after a failed publication.
+
+The marker is exclusively created with a per-run random token and checked as
+the same regular file before publish. Platforms with `O_NOFOLLOW` use it;
+Windows uses exclusive creation plus an identity/token check and rejects an
+existing marker or reparse point. This is a cooperative-writer safety protocol,
+not an authenticity boundary against a principal that can modify the output
+directory. Consumers must use the ready condition above, and deployment must
+protect the destination directory with appropriate storage permissions.
 
 The input layout is semicolon-delimited:
 

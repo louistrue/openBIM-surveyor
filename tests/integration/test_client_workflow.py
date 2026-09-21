@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import importlib.util
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Barrier, Thread
@@ -192,7 +193,7 @@ class ClientWorkflowIntegrationTests(unittest.TestCase):
             persisted = json.loads((output_dir / "workflow_summary.json").read_text(encoding="utf-8"))
             self.assertEqual(persisted["input"], results[0]["input"])
             self.assertFalse(
-                (output_dir / complete_client_workflow.RESERVATION_FILENAME).exists(),
+                (output_dir / complete_client_workflow.INCOMPLETE_FILENAME).exists(),
                 "the completed workflow must release its exclusive reservation",
             )
 
@@ -227,7 +228,7 @@ class ClientWorkflowIntegrationTests(unittest.TestCase):
                 (output_dir / "artifact.txt").read_text(encoding="utf-8"),
                 "complete artifact\n",
             )
-            self.assertFalse((output_dir / complete_client_workflow.RESERVATION_FILENAME).exists())
+            self.assertFalse((output_dir / complete_client_workflow.INCOMPLETE_FILENAME).exists())
 
     @unittest.skipUnless(HAS_CSV_TO_IFC_DEPENDENCIES, "requires pandas and ifcopenshell")
     def test_failed_terrain_export_leaves_no_published_or_staged_artifacts(self) -> None:
@@ -253,8 +254,177 @@ class ClientWorkflowIntegrationTests(unittest.TestCase):
                         config=default_config(),
                     )
 
-            self.assertFalse(output_dir.exists())
+            self.assertTrue(output_dir.is_dir())
+            self.assertTrue((output_dir / complete_client_workflow.INCOMPLETE_FILENAME).is_file())
+            self.assertEqual(
+                list(output_dir.iterdir()),
+                [output_dir / complete_client_workflow.INCOMPLETE_FILENAME],
+            )
             self.assertEqual(list(temporary.glob(".failed-output.bonsai-topo-stage-*")), [])
+
+    def test_forged_reservation_symlink_cannot_overwrite_external_content(self) -> None:
+        """Regression for #5051: marker creation must not follow a forged symlink."""
+
+        with TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            destination = temporary / "output"
+            external = temporary / "external.txt"
+            external.write_text("external content\n", encoding="utf-8")
+            marker = destination / complete_client_workflow.INCOMPLETE_FILENAME
+            original_open = complete_client_workflow.os.open
+
+            def forge_marker(path, flags, mode=0o777):
+                if Path(path) == marker and flags & complete_client_workflow.os.O_EXCL:
+                    os.symlink(external, marker)
+                return original_open(path, flags, mode)
+
+            with mock.patch.object(complete_client_workflow.os, "open", side_effect=forge_marker):
+                with self.assertRaises(FileExistsError):
+                    complete_client_workflow.reserve_workflow_workspace(destination)
+
+            self.assertEqual(external.read_text(encoding="utf-8"), "external content\n")
+            self.assertTrue(marker.is_symlink())
+
+    def test_forged_summary_stays_incomplete_and_is_not_replaced(self) -> None:
+        """Regression for #5051: a contender's ready marker cannot be overwritten."""
+
+        with TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            workspace = complete_client_workflow.reserve_workflow_workspace(temporary / "output")
+            try:
+                (workspace.staging / "artifact.txt").write_text("ours\n", encoding="utf-8")
+                (workspace.staging / "workflow_summary.json").write_text("{}\n", encoding="utf-8")
+                forged_summary = workspace.destination / "workflow_summary.json"
+                forged_summary.write_text("forged\n", encoding="utf-8")
+
+                with self.assertRaises(FileExistsError):
+                    complete_client_workflow.publish_workflow_workspace(workspace)
+
+                self.assertEqual(forged_summary.read_text(encoding="utf-8"), "forged\n")
+                self.assertEqual(
+                    (workspace.destination / "artifact.txt").read_text(encoding="utf-8"), "ours\n"
+                )
+                self.assertTrue(workspace.reservation.is_file())
+            finally:
+                complete_client_workflow.release_workflow_workspace(workspace)
+
+    def test_tampered_reservation_token_fails_closed_before_publication(self) -> None:
+        """The marker must bind publication to the run that created the workspace."""
+
+        with TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            workspace = complete_client_workflow.reserve_workflow_workspace(temporary / "output")
+            try:
+                (workspace.staging / "artifact.txt").write_text("ours\n", encoding="utf-8")
+                (workspace.staging / "workflow_summary.json").write_text("{}\n", encoding="utf-8")
+                workspace.reservation.write_text("token=forged\nstate=incomplete\n", encoding="ascii")
+
+                with self.assertRaisesRegex(RuntimeError, "marker token does not belong"):
+                    complete_client_workflow.publish_workflow_workspace(workspace)
+
+                self.assertFalse((workspace.destination / "artifact.txt").exists())
+                self.assertTrue(workspace.reservation.is_file())
+            finally:
+                complete_client_workflow.release_workflow_workspace(workspace)
+
+    def test_publish_failure_never_deletes_a_substituted_destination_file(self) -> None:
+        """Regression for #5051: failure cleanup must not unlink destination artifacts."""
+
+        with TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            workspace = complete_client_workflow.reserve_workflow_workspace(temporary / "output")
+            try:
+                first = workspace.staging / "first.txt"
+                second = workspace.staging / "second.txt"
+                first.write_text("ours\n", encoding="utf-8")
+                second.write_text("second\n", encoding="utf-8")
+                (workspace.staging / "workflow_summary.json").write_text("{}\n", encoding="utf-8")
+                (workspace.destination / "second.txt").write_text("contender\n", encoding="utf-8")
+                external = temporary / "external.txt"
+                external.write_text("external content\n", encoding="utf-8")
+                first_target = workspace.destination / "first.txt"
+                original_link = complete_client_workflow.os.link
+
+                def substitute_before_second_link(source, target):
+                    if Path(source) == second:
+                        os.replace(external, first_target)
+                    return original_link(source, target)
+
+                with mock.patch.object(
+                    complete_client_workflow.os, "link", side_effect=substitute_before_second_link
+                ):
+                    with self.assertRaises(FileExistsError):
+                        complete_client_workflow.publish_workflow_workspace(workspace)
+
+                self.assertFalse(external.exists())
+                self.assertEqual(first_target.read_text(encoding="utf-8"), "external content\n")
+                self.assertTrue(workspace.reservation.is_file())
+            finally:
+                complete_client_workflow.release_workflow_workspace(workspace)
+
+    def test_staging_substitution_is_left_for_manual_inspection(self) -> None:
+        """Regression for #5051: cleanup only removes the staging directory this run owns."""
+
+        with TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            workspace = complete_client_workflow.reserve_workflow_workspace(temporary / "output")
+            replacement = temporary / "external-stage"
+            replacement.mkdir()
+            (replacement / "external.txt").write_text("external content\n", encoding="utf-8")
+            os.rmdir(workspace.staging)
+            os.replace(replacement, workspace.staging)
+
+            with self.assertRaisesRegex(RuntimeError, "staging is no longer owned"):
+                complete_client_workflow.release_workflow_workspace(workspace)
+
+            self.assertEqual(
+                (workspace.staging / "external.txt").read_text(encoding="utf-8"),
+                "external content\n",
+            )
+
+    def test_summary_is_linked_last_and_clears_the_incomplete_marker_on_success(self) -> None:
+        """Consumers can require summary present and the incomplete marker absent."""
+
+        with TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            workspace = complete_client_workflow.reserve_workflow_workspace(temporary / "output")
+            try:
+                (workspace.staging / "artifact.txt").write_text("complete\n", encoding="utf-8")
+                (workspace.staging / "workflow_summary.json").write_text("{}\n", encoding="utf-8")
+                original_link = complete_client_workflow.os.link
+                targets: list[Path] = []
+
+                def record_link(source, target):
+                    targets.append(Path(target))
+                    return original_link(source, target)
+
+                with mock.patch.object(complete_client_workflow.os, "link", side_effect=record_link):
+                    complete_client_workflow.publish_workflow_workspace(workspace)
+
+                self.assertEqual(targets[-1].name, "workflow_summary.json")
+                self.assertTrue((workspace.destination / "workflow_summary.json").is_file())
+                self.assertFalse(workspace.reservation.exists())
+            finally:
+                complete_client_workflow.release_workflow_workspace(workspace)
+
+    def test_staging_is_created_on_the_destination_filesystem_for_hard_link_publish(self) -> None:
+        """Hard-link publication requires staging and destination to share a device."""
+
+        with TemporaryDirectory() as directory:
+            workspace = complete_client_workflow.reserve_workflow_workspace(Path(directory) / "output")
+            try:
+                self.assertEqual(workspace.staging.stat().st_dev, workspace.destination.stat().st_dev)
+            finally:
+                complete_client_workflow.release_workflow_workspace(workspace)
+
+    def test_missing_nofollow_fails_closed_on_non_windows_platforms(self) -> None:
+        """Do not silently follow a marker when a non-Windows platform lacks O_NOFOLLOW."""
+
+        if complete_client_workflow.os.name == "nt":
+            self.skipTest("Windows uses the O_EXCL plus identity-check fallback")
+        with mock.patch.object(complete_client_workflow.os, "O_NOFOLLOW", None):
+            with self.assertRaisesRegex(RuntimeError, "cannot open workflow markers"):
+                complete_client_workflow._marker_open_flags(writable=True)
 
     def test_landxml_serialized_bytes_are_well_formed_and_declare_metre_units(self) -> None:
         """The supported terrain handoff validates XML bytes and its constrained schema shape."""
