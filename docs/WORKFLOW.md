@@ -9,9 +9,13 @@ python experiments/prototypes/complete_client_workflow.py input.csv \
   --output-dir /safe/output/run
 ```
 
-Omitting `--output-dir` creates a new temporary directory. The command rejects
-the repository's tracked `data/processed` and `data/output` directories and
-does not overwrite a previous run.
+Omitting `--output-dir` publishes to a new temporary directory. An explicit
+`--output-dir` must not already exist. The command rejects the repository's
+tracked `data/processed` and `data/output` directories, reserves the requested
+destination exclusively, writes every artifact to a private sibling staging
+directory, and atomically publishes the directory only after the complete run
+succeeds. A failed run leaves no published partial CSV, IFC, LandXML, or
+summary artifacts.
 
 The input layout is semicolon-delimited:
 

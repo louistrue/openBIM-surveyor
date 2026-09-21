@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +39,15 @@ TRACKED_OUTPUT_DIRECTORIES = (
 )
 
 
+@dataclass(frozen=True)
+class WorkflowWorkspace:
+    """A private staging directory and exclusive reservation for one run."""
+
+    destination: Path
+    staging: Path
+    reservation: Path
+
+
 def default_config() -> dict[str, Any]:
     """Return the CRS declaration required for this client's projected CSV."""
 
@@ -48,10 +60,14 @@ def default_config() -> dict[str, Any]:
 
 
 def resolve_output_directory(requested: Path | None) -> Path:
-    """Choose a fresh directory and prevent writes into tracked sample outputs."""
+    """Choose an as-yet-unpublished directory outside tracked sample outputs."""
 
     if requested is None:
-        return Path(tempfile.mkdtemp(prefix="bonsai-topo-workflow-"))
+        # ``mkdtemp`` reserves a collision-free name. Remove its empty directory
+        # immediately: publication below is one atomic directory rename.
+        output_dir = Path(tempfile.mkdtemp(prefix="bonsai-topo-workflow-"))
+        output_dir.rmdir()
+        return output_dir
 
     output_dir = requested.resolve()
     for tracked_directory in TRACKED_OUTPUT_DIRECTORIES:
@@ -63,12 +79,70 @@ def resolve_output_directory(requested: Path | None) -> Path:
             f"Refusing to write to tracked output directory: {output_dir}. "
             "Choose a directory outside data/processed and data/output."
         )
-    output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
 
-def require_fresh_outputs(output_dir: Path, stem: str, include_landxml: bool) -> dict[str, Path]:
-    """Allocate named outputs without silently replacing a previous deliverable."""
+def _path_is_occupied(path: Path) -> bool:
+    """Include a dangling symlink, which ``Path.exists`` intentionally omits."""
+
+    return path.exists() or path.is_symlink()
+
+
+def _reservation_path(destination: Path) -> Path:
+    return destination.parent / f".{destination.name}.bonsai-topo-reservation"
+
+
+def reserve_workflow_workspace(destination: Path) -> WorkflowWorkspace:
+    """Exclusively reserve a destination and create a private sibling staging dir."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    reservation = _reservation_path(destination)
+    try:
+        descriptor = os.open(reservation, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"Another workflow is already preparing this output directory: {destination}."
+        ) from exc
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(f"pid={os.getpid()}\n")
+
+    try:
+        if _path_is_occupied(destination):
+            raise FileExistsError(
+                f"Refusing to overwrite existing workflow output directory: {destination}"
+            )
+        staging = Path(
+            tempfile.mkdtemp(
+                prefix=f".{destination.name}.bonsai-topo-stage-",
+                dir=destination.parent,
+            )
+        )
+    except BaseException:
+        reservation.unlink(missing_ok=True)
+        raise
+    return WorkflowWorkspace(destination, staging, reservation)
+
+
+def release_workflow_workspace(workspace: WorkflowWorkspace) -> None:
+    """Remove only this run's private staging directory and reservation."""
+
+    if workspace.staging.exists():
+        shutil.rmtree(workspace.staging)
+    workspace.reservation.unlink(missing_ok=True)
+
+
+def publish_workflow_workspace(workspace: WorkflowWorkspace) -> None:
+    """Atomically publish a completed run without replacing an existing output."""
+
+    if _path_is_occupied(workspace.destination):
+        raise FileExistsError(
+            f"Refusing to overwrite existing workflow output directory: {workspace.destination}"
+        )
+    os.replace(workspace.staging, workspace.destination)
+
+
+def workflow_output_paths(output_dir: Path, stem: str, include_landxml: bool) -> dict[str, Path]:
+    """Return the public paths that a successfully published run will contain."""
 
     outputs = {
         "processed_csv": output_dir / f"{stem}_processed.csv",
@@ -78,10 +152,6 @@ def require_fresh_outputs(output_dir: Path, stem: str, include_landxml: bool) ->
     }
     if include_landxml:
         outputs["landxml"] = output_dir / f"{stem}_terrain.xml"
-    existing = [path for path in outputs.values() if path.exists()]
-    if existing:
-        names = ", ".join(str(path) for path in existing)
-        raise FileExistsError(f"Refusing to overwrite existing workflow output(s): {names}")
     return outputs
 
 
@@ -109,64 +179,72 @@ def run_workflow(
         raise ValueError("--terrain-ifc and --terrain-global-id must be supplied together.")
 
     active_config = config or default_config()
-    outputs = require_fresh_outputs(
-        output_dir,
-        input_csv.stem,
-        include_landxml=terrain_ifc is not None,
+    workspace = reserve_workflow_workspace(output_dir)
+    public_outputs = workflow_output_paths(
+        output_dir, input_csv.stem, include_landxml=terrain_ifc is not None
     )
-    from client_data_processor import process_client_csv
-
-    if not process_client_csv(input_csv, outputs["processed_csv"], active_config):
-        raise RuntimeError("CSV processing failed; see the diagnostic above.")
-
-    transform_info = json.loads(outputs["transform_info"].read_text(encoding="utf-8"))
-    transform_info["target_crs"] = active_config["target_crs"]
-    outputs["transform_info"].write_text(
-        json.dumps(transform_info, indent=2) + "\n", encoding="utf-8"
+    staged_outputs = workflow_output_paths(
+        workspace.staging, input_csv.stem, include_landxml=terrain_ifc is not None
     )
-    if not create_basic_ifc_with_survey_points(
-        outputs["processed_csv"], outputs["ifc"], transform_info
-    ):
-        raise RuntimeError("IFC export failed; install a compatible ifcopenshell package.")
+    try:
+        from client_data_processor import process_client_csv
 
-    landxml_status: dict[str, str] = {
-        "status": "not_requested",
-        "reason": (
-            "Survey-point IFCs are not terrain TINs. Author and validate an "
-            "IfcGeographicElement with one IfcTriangulatedFaceSet before exporting LandXML."
-        ),
-    }
-    if terrain_ifc is not None:
-        try:
-            mesh = export_ifc_terrain_to_landxml(
-                terrain_ifc,
-                outputs["landxml"],
-                terrain_global_id=terrain_global_id,
-            )
-        except LandXmlExportError as exc:
-            raise RuntimeError(f"LandXML export rejected the authored terrain: {exc}") from exc
-        landxml_status = {
-            "status": "created",
-            "path": str(outputs["landxml"]),
-            "terrain": mesh.name,
-            "points": str(len(mesh.vertices_enz)),
-            "faces": str(len(mesh.faces)),
-            "crs": mesh.crs_name,
+        if not process_client_csv(input_csv, staged_outputs["processed_csv"], active_config):
+            raise RuntimeError("CSV processing failed; see the diagnostic above.")
+
+        transform_info = json.loads(staged_outputs["transform_info"].read_text(encoding="utf-8"))
+        transform_info["target_crs"] = active_config["target_crs"]
+        staged_outputs["transform_info"].write_text(
+            json.dumps(transform_info, indent=2) + "\n", encoding="utf-8"
+        )
+        if not create_basic_ifc_with_survey_points(
+            staged_outputs["processed_csv"], staged_outputs["ifc"], transform_info
+        ):
+            raise RuntimeError("IFC export failed; install a compatible ifcopenshell package.")
+
+        landxml_status: dict[str, str] = {
+            "status": "not_requested",
+            "reason": (
+                "Survey-point IFCs are not terrain TINs. Author and validate an "
+                "IfcGeographicElement with one IfcTriangulatedFaceSet before exporting LandXML."
+            ),
         }
+        if terrain_ifc is not None:
+            try:
+                mesh = export_ifc_terrain_to_landxml(
+                    terrain_ifc,
+                    staged_outputs["landxml"],
+                    terrain_global_id=terrain_global_id,
+                )
+            except LandXmlExportError as exc:
+                raise RuntimeError(f"LandXML export rejected the authored terrain: {exc}") from exc
+            landxml_status = {
+                "status": "created",
+                "path": str(public_outputs["landxml"]),
+                "terrain": mesh.name,
+                "points": str(len(mesh.vertices_enz)),
+                "faces": str(len(mesh.faces)),
+                "crs": mesh.crs_name,
+            }
 
-    summary: dict[str, Any] = {
-        "workflow": "CSV survey points to IFC annotations",
-        "input": str(input_csv),
-        "outputs": {name: str(path) for name, path in outputs.items()},
-        "crs": active_config["target_crs"],
-        "landxml": landxml_status,
-        "limitations": [
-            "The generated IFC contains survey-point annotations, not a terrain design.",
-            "No machine-control or third-party application compatibility is certified.",
-        ],
-    }
-    outputs["summary"].write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    return summary
+        summary: dict[str, Any] = {
+            "workflow": "CSV survey points to IFC annotations",
+            "input": str(input_csv),
+            "outputs": {name: str(path) for name, path in public_outputs.items()},
+            "crs": active_config["target_crs"],
+            "landxml": landxml_status,
+            "limitations": [
+                "The generated IFC contains survey-point annotations, not a terrain design.",
+                "No machine-control or third-party application compatibility is certified.",
+            ],
+        }
+        staged_outputs["summary"].write_text(
+            json.dumps(summary, indent=2) + "\n", encoding="utf-8"
+        )
+        publish_workflow_workspace(workspace)
+        return summary
+    finally:
+        release_workflow_workspace(workspace)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -175,7 +253,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        help="new or empty directory outside tracked data/ outputs (default: a new temp directory)",
+        help="new directory outside tracked data/ outputs (default: a new temporary directory)",
     )
     parser.add_argument(
         "--terrain-ifc",
